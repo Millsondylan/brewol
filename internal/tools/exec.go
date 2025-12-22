@@ -177,6 +177,51 @@ func KillProcess(cmd *exec.Cmd) error {
 	return cmd.Process.Kill()
 }
 
+// ShellTool is an alias for ExecTool with simplified args (just "command" field)
+// Used by the engine when executing commands from code blocks
+type ShellTool struct {
+	root string
+}
+
+type shellArgs struct {
+	Command string `json:"command"`
+}
+
+func (t *ShellTool) Name() string { return "shell" }
+
+func (t *ShellTool) Description() string {
+	return "Execute a shell command. Simplified interface for running commands extracted from code blocks."
+}
+
+func (t *ShellTool) Parameters() map[string]interface{} {
+	return map[string]interface{}{
+		"type": "object",
+		"properties": map[string]interface{}{
+			"command": map[string]interface{}{
+				"type":        "string",
+				"description": "Command to execute",
+			},
+		},
+		"required": []string{"command"},
+	}
+}
+
+func (t *ShellTool) Execute(ctx context.Context, args json.RawMessage) (*ToolResult, error) {
+	var a shellArgs
+	if err := json.Unmarshal(args, &a); err != nil {
+		return &ToolResult{Name: t.Name(), Error: err}, err
+	}
+
+	// Delegate to ExecTool with the command
+	execTool := &ExecTool{root: t.root}
+	execArgs, _ := json.Marshal(execArgs{Cmd: a.Command, TimeoutSec: 120})
+	result, err := execTool.Execute(ctx, execArgs)
+	if result != nil {
+		result.Name = t.Name() // Override name to "shell"
+	}
+	return result, err
+}
+
 // ValidatePathContainment checks if a path is within the workspace root
 func ValidatePathContainment(root, path string) error {
 	if filepath.IsAbs(path) {

@@ -384,7 +384,15 @@ func (e *Engine) initializeSession(ctx context.Context) {
 }
 
 func (e *Engine) buildSystemPrompt() {
-	systemPrompt := fmt.Sprintf(`You are an autonomous coding agent. Project: %s (%s). Be concise.`,
+	systemPrompt := fmt.Sprintf(`You are an autonomous coding agent working in %s (%s).
+
+OUTPUT COMMANDS IN BASH CODE BLOCKS TO EXECUTE THEM:
+`+"```bash"+`
+ls -la
+cat file.txt
+`+"```"+`
+
+I will run those commands and show you the output. Be concise. Do one thing at a time.`,
 		e.project.Root,
 		e.project.Type,
 	)
@@ -448,14 +456,71 @@ func (e *Engine) runCycle(ctx context.Context) error {
 	// Add assistant response to conversation
 	e.messages = append(e.messages, response.Message)
 
+	// Extract and execute commands from response
+	e.setState(StateExecuting)
+	commands := e.extractCommands(response.Message.Content)
+	if len(commands) > 0 {
+		for _, cmd := range commands {
+			e.sendUpdate(CycleUpdate{State: StateExecuting, Message: fmt.Sprintf("Running: %s", cmd)})
+			result, err := e.tools.Execute(ctx, "shell", json.RawMessage(fmt.Sprintf(`{"command":%q}`, cmd)))
+			if err != nil {
+				e.sendUpdate(CycleUpdate{State: StateExecuting, Message: fmt.Sprintf("Error: %v", err)})
+			} else if result != nil {
+				e.sendUpdate(CycleUpdate{State: StateExecuting, ToolResult: result})
+				// Add result to conversation
+				e.messages = append(e.messages, ollama.Message{
+					Role:    "user",
+					Content: fmt.Sprintf("Command output:\n%s", result.Output),
+				})
+			}
+		}
+	} else {
+		e.sendUpdate(CycleUpdate{State: StateExecuting, Message: "No commands found in response"})
+	}
+
 	// Trim context to avoid growing too large
 	e.trimContext()
 
-	// Wait before next cycle
-	e.sendUpdate(CycleUpdate{State: StateObserving, Message: "Cycle complete. Waiting 5s..."})
-	time.Sleep(5 * time.Second)
+	// Short pause before next cycle
+	time.Sleep(2 * time.Second)
 
 	return nil
+}
+
+// extractCommands finds executable commands in the model response
+func (e *Engine) extractCommands(content string) []string {
+	var commands []string
+	lines := strings.Split(content, "\n")
+	inCodeBlock := false
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+
+		// Check for code blocks
+		if strings.HasPrefix(line, "```bash") || strings.HasPrefix(line, "```sh") || strings.HasPrefix(line, "```shell") {
+			inCodeBlock = true
+			continue
+		}
+		if strings.HasPrefix(line, "```") && inCodeBlock {
+			inCodeBlock = false
+			continue
+		}
+
+		// Capture commands in code blocks
+		if inCodeBlock && line != "" && !strings.HasPrefix(line, "#") {
+			commands = append(commands, line)
+		}
+
+		// Also look for "$ command" or "RUN: command" patterns
+		if strings.HasPrefix(line, "$ ") {
+			commands = append(commands, strings.TrimPrefix(line, "$ "))
+		}
+		if strings.HasPrefix(line, "RUN: ") {
+			commands = append(commands, strings.TrimPrefix(line, "RUN: "))
+		}
+	}
+
+	return commands
 }
 
 func (e *Engine) observe(ctx context.Context) (string, error) {
