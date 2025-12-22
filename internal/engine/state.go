@@ -439,6 +439,8 @@ func (e *Engine) runCycle(ctx context.Context) error {
 		return fmt.Errorf("decide failed: %w", err)
 	}
 
+	e.sendUpdate(CycleUpdate{State: StateDeciding, Message: fmt.Sprintf("Got response (%d chars)", len(response.Message.Content))})
+
 	// Parse suggestions from response
 	suggestions := e.parseSuggestions(response.Message.Content)
 	e.sendUpdate(CycleUpdate{State: StateDeciding, Suggestions: suggestions})
