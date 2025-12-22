@@ -1,0 +1,120 @@
+# GoReleaser configuration for brewol
+# https://goreleaser.com
+
+version: 2
+
+project_name: brewol
+
+before:
+  hooks:
+    - go mod tidy
+    - go generate ./...
+
+builds:
+  - id: brewol
+    main: ./cmd/brewol
+    binary: brewol
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ldflags:
+      - -s -w
+      - -X main.version={{.Version}}
+      - -X main.commit={{.Commit}}
+      - -X main.date={{.Date}}
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - id: default
+    format: tar.gz
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Version }}_
+      {{- title .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+    format_overrides:
+      - goos: windows
+        format: zip
+    files:
+      - README.md
+      - LICENSE*
+
+checksum:
+  name_template: "checksums.txt"
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - Merge pull request
+      - Merge branch
+
+brews:
+  - name: brewol
+    repository:
+      owner: "{{ .Env.GITHUB_REPOSITORY_OWNER }}"
+      name: homebrew-tap
+      token: "{{ .Env.HOMEBREW_TAP_GITHUB_TOKEN }}"
+    directory: Formula
+    homepage: "https://github.com/{{ .Env.GITHUB_REPOSITORY }}"
+    description: "Autonomous coding agent TUI - never stops working"
+    license: MIT
+    install: |
+      bin.install "brewol"
+    test: |
+      system "#{bin}/brewol", "--version"
+    dependencies:
+      - name: ollama
+        type: optional
+
+# Cask for macOS (preferred over formula for GUI/TUI apps)
+# Note: Casks require a separate homebrew-cask-tap repository
+# This is configured via the brews section above for simplicity
+
+release:
+  github:
+    owner: "{{ .Env.GITHUB_REPOSITORY_OWNER }}"
+    name: "{{ .Env.GITHUB_REPOSITORY_NAME }}"
+  draft: false
+  prerelease: auto
+  mode: replace
+  header: |
+    ## brewol {{ .Version }}
+
+    Autonomous coding agent TUI.
+  footer: |
+    ## Installation
+
+    ### Homebrew (macOS/Linux)
+    ```bash
+    brew tap {{ .Env.GITHUB_REPOSITORY_OWNER }}/tap
+    brew install brewol
+    ```
+
+    ### Binary Download
+    Download the appropriate binary for your platform from the assets below.
+
+    ### From Source
+    ```bash
+    go install github.com/{{ .Env.GITHUB_REPOSITORY }}@{{ .Version }}
+    ```
+  name_template: "v{{ .Version }}"
+
+# Announce releases (optional)
+# announce:
+#   slack:
+#     enabled: false

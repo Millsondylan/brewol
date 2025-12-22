@@ -1,0 +1,37 @@
+# Binaries (at root only)
+/brewol
+/*.exe
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
+coverage.html
+
+# Dependency directories
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# brewol session logs (keep structure but not contents)
+.brewol/logs/*/
+
+# GoReleaser
+dist/
+
+# Environment files
+.env
+.env.local
