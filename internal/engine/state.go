@@ -398,17 +398,27 @@ func (e *Engine) runCycle(ctx context.Context) error {
 	// Wait for a goal before doing anything
 	e.mu.RLock()
 	goal := e.goal
+	model := e.client.GetModel()
 	e.mu.RUnlock()
 
 	if goal == "" {
 		e.setState(StateObserving)
-		e.sendUpdate(CycleUpdate{State: StateObserving, Message: "Waiting for goal... Use /goal <your goal>"})
+		e.sendUpdate(CycleUpdate{State: StateObserving, Message: "Waiting for goal... Type your goal and press Enter"})
+		time.Sleep(2 * time.Second)
+		return nil
+	}
+
+	if model == "" {
+		e.setState(StateObserving)
+		e.sendUpdate(CycleUpdate{State: StateObserving, Message: "No model selected! Use /model to pick one"})
 		time.Sleep(2 * time.Second)
 		return nil
 	}
 
 	// Phase 1: Observe
 	e.setState(StateObserving)
+	e.sendUpdate(CycleUpdate{State: StateObserving, Message: fmt.Sprintf("Goal: %s | Model: %s", goal, model)})
+
 	observation, err := e.observe(ctx)
 	if err != nil {
 		return fmt.Errorf("observe failed: %w", err)
@@ -422,6 +432,8 @@ func (e *Engine) runCycle(ctx context.Context) error {
 
 	// Phase 2: Decide
 	e.setState(StateDeciding)
+	e.sendUpdate(CycleUpdate{State: StateDeciding, Message: "Sending to model..."})
+
 	response, err := e.decide(ctx)
 	if err != nil {
 		return fmt.Errorf("decide failed: %w", err)
