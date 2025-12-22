@@ -11,7 +11,9 @@ import (
 	"time"
 
 	"github.com/ai/brewol/internal/logs"
+	"github.com/ai/brewol/internal/memory"
 	"github.com/ai/brewol/internal/ollama"
+	"github.com/ai/brewol/internal/prompt"
 	"github.com/ai/brewol/internal/repo"
 	"github.com/ai/brewol/internal/tools"
 )
@@ -80,25 +82,29 @@ type CycleUpdate struct {
 
 // Engine is the autonomous agent engine
 type Engine struct {
-	client       *ollama.Client
-	tools        *tools.Registry
-	project      *repo.Project
-	verifier     *repo.Verifier
-	session      *logs.Session
-	messages     []ollama.Message
-	backlog      []BacklogItem
-	objective    string
-	state        State
-	summary      string
-	cycleCount   int
-	updates      chan CycleUpdate
-	cancel       context.CancelFunc
-	mu           sync.RWMutex
-	goal         string // user-set goal
-	speed        int    // throttle (0 = no throttle)
-	paused       bool   // pause flag
-	errorCount   int    // consecutive error count
-	lastError    string // last error message
+	client        *ollama.Client
+	tools         *tools.Registry
+	project       *repo.Project
+	verifier      *repo.Verifier
+	session       *logs.Session
+	promptMgr     *prompt.Manager
+	memoryMgr     *memory.Manager
+	messages      []ollama.Message
+	backlog       []BacklogItem
+	objective     string
+	state         State
+	summary       string
+	cycleCount    int
+	updates       chan CycleUpdate
+	cancel        context.CancelFunc
+	mu            sync.RWMutex
+	goal          string // user-set goal
+	speed         int    // throttle (0 = no throttle)
+	paused        bool   // pause flag
+	errorCount    int    // consecutive error count
+	lastError     string // last error message
+	lastVerifyOK  bool   // last verification result
+	pendingCommit bool   // whether there are changes pending commit
 }
 
 // Config holds engine configuration
@@ -120,17 +126,36 @@ func NewEngine(cfg Config) (*Engine, error) {
 		return nil, fmt.Errorf("failed to create logging session: %w", err)
 	}
 
+	// Create prompt manager for instruction layering
+	promptMgr := prompt.NewManager("brewol", cfg.WorkspaceRoot, string(project.Type))
+
+	// Create memory manager for rolling memory
+	memoryMgr, err := memory.NewManager(memory.Config{
+		WorkspaceRoot:   cfg.WorkspaceRoot,
+		UpdateInterval:  5,
+		MaxContextTurns: 10,
+	})
+	if err != nil {
+		session.Close()
+		return nil, fmt.Errorf("failed to create memory manager: %w", err)
+	}
+
+	// Initialize memory with project info
+	memoryMgr.SetProjectInfo(string(project.Type), project.BuildCommand, project.TestCommand)
+
 	e := &Engine{
-		client:   client,
-		tools:    toolRegistry,
-		project:  project,
-		verifier: verifier,
-		session:  session,
-		messages: make([]ollama.Message, 0),
-		backlog:  make([]BacklogItem, 0),
-		state:    StateObserving,
-		updates:  make(chan CycleUpdate, 100),
-		goal:     cfg.Goal,
+		client:    client,
+		tools:     toolRegistry,
+		project:   project,
+		verifier:  verifier,
+		session:   session,
+		promptMgr: promptMgr,
+		memoryMgr: memoryMgr,
+		messages:  make([]ollama.Message, 0),
+		backlog:   make([]BacklogItem, 0),
+		state:     StateObserving,
+		updates:   make(chan CycleUpdate, 100),
+		goal:      cfg.Goal,
 	}
 
 	return e, nil
@@ -275,10 +300,110 @@ func (e *Engine) Session() *logs.Session {
 	return e.session
 }
 
+// PromptManager returns the prompt manager
+func (e *Engine) PromptManager() *prompt.Manager {
+	return e.promptMgr
+}
+
+// MemoryManager returns the memory manager
+func (e *Engine) MemoryManager() *memory.Manager {
+	return e.memoryMgr
+}
+
+// GetEffectiveSystemPrompt returns the effective system prompt (redacted for display)
+func (e *Engine) GetEffectiveSystemPrompt() string {
+	return e.promptMgr.GetEffectivePromptRedacted()
+}
+
+// SetSessionInstructions sets session-level instructions and rebuilds the prompt
+func (e *Engine) SetSessionInstructions(instructions string) {
+	e.promptMgr.SetSessionInstructions(instructions)
+	e.rebuildSystemPrompt()
+}
+
+// ClearSessionInstructions clears session instructions and rebuilds the prompt
+func (e *Engine) ClearSessionInstructions() {
+	e.promptMgr.ClearSessionInstructions()
+	e.rebuildSystemPrompt()
+}
+
+// LoadInstructionsFromFile loads instructions from a file
+func (e *Engine) LoadInstructionsFromFile(path string) error {
+	if err := e.promptMgr.LoadInstructionsFromFile(path); err != nil {
+		return err
+	}
+	e.rebuildSystemPrompt()
+	return nil
+}
+
+// SaveSessionInstructions saves session instructions to user config
+func (e *Engine) SaveSessionInstructions() error {
+	return e.promptMgr.SaveSessionToUser()
+}
+
+// GetSummary returns a summary of the current operational state
+func (e *Engine) GetSummary() Summary {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	// Get backlog items (max 5)
+	backlogItems := make([]string, 0, 5)
+	for i, item := range e.backlog {
+		if i >= 5 {
+			break
+		}
+		backlogItems = append(backlogItems, item.Description)
+	}
+
+	branch := tools.GetCurrentBranch(e.project.Root)
+	dirtyFiles := tools.GetDirtyFiles(e.project.Root)
+
+	return Summary{
+		CurrentObjective:    e.objective,
+		CurrentState:        e.state.String(),
+		CurrentGoal:         e.goal,
+		CycleCount:          e.cycleCount,
+		LastVerificationOK:  e.lastVerifyOK,
+		CurrentBranch:       branch,
+		DirtyFiles:          dirtyFiles,
+		BacklogItems:        backlogItems,
+		IsPaused:            e.paused,
+		ErrorCount:          e.errorCount,
+		LastError:           e.lastError,
+	}
+}
+
+// Summary represents an operational summary
+type Summary struct {
+	CurrentObjective    string
+	CurrentState        string
+	CurrentGoal         string
+	CycleCount          int
+	LastVerificationOK  bool
+	CurrentBranch       string
+	DirtyFiles          []string
+	BacklogItems        []string
+	IsPaused            bool
+	ErrorCount          int
+	LastError           string
+}
+
+// ResetMemory resets the working memory
+func (e *Engine) ResetMemory() {
+	e.memoryMgr.Reset()
+	e.rebuildSystemPrompt()
+}
+
+// GetWorkingMemory returns the current working memory text
+func (e *Engine) GetWorkingMemory() string {
+	return e.memoryMgr.GetWorkingMemoryText()
+}
+
 // run is the main autonomous loop
 func (e *Engine) run(ctx context.Context) {
 	defer close(e.updates)
 	defer e.session.Close()
+	defer e.memoryMgr.Close()
 
 	// Initial setup
 	e.initializeSession(ctx)
@@ -384,21 +509,33 @@ func (e *Engine) initializeSession(ctx context.Context) {
 }
 
 func (e *Engine) buildSystemPrompt() {
-	systemPrompt := fmt.Sprintf(`You are an autonomous coding agent working in %s (%s).
+	// Get effective prompt from all instruction layers
+	systemPrompt := e.promptMgr.GetEffectivePrompt()
 
-OUTPUT COMMANDS IN BASH CODE BLOCKS TO EXECUTE THEM:
-`+"```bash"+`
-ls -la
-cat file.txt
-`+"```"+`
-
-I will run those commands and show you the output. Be concise. Do one thing at a time.`,
-		e.project.Root,
-		e.project.Type,
-	)
+	// Append working memory if available
+	memoryText := e.memoryMgr.GetWorkingMemoryText()
+	if memoryText != "" {
+		systemPrompt += "\n\n" + memoryText
+	}
 
 	e.messages = []ollama.Message{
 		{Role: "system", Content: systemPrompt},
+	}
+}
+
+// rebuildSystemPrompt rebuilds the system prompt and updates messages[0]
+func (e *Engine) rebuildSystemPrompt() {
+	systemPrompt := e.promptMgr.GetEffectivePrompt()
+
+	memoryText := e.memoryMgr.GetWorkingMemoryText()
+	if memoryText != "" {
+		systemPrompt += "\n\n" + memoryText
+	}
+
+	if len(e.messages) > 0 {
+		e.messages[0] = ollama.Message{Role: "system", Content: systemPrompt}
+	} else {
+		e.messages = []ollama.Message{{Role: "system", Content: systemPrompt}}
 	}
 }
 
@@ -480,6 +617,13 @@ func (e *Engine) runCycle(ctx context.Context) error {
 
 	// Trim context to avoid growing too large
 	e.trimContext()
+
+	// Update git state in memory
+	branch := tools.GetCurrentBranch(e.project.Root)
+	e.memoryMgr.SetGitState(branch, "")
+
+	// Notify memory manager of cycle completion (may trigger periodic update)
+	e.memoryMgr.OnCycleComplete(e.cycleCount + 1)
 
 	// Short pause before next cycle
 	time.Sleep(2 * time.Second)

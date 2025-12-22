@@ -159,6 +159,11 @@ func AvailableCommands() []Command {
 		{Name: "/clear", Description: "Clear the output", NeedsArg: false},
 		{Name: "/pause", Description: "Pause the agent", NeedsArg: false},
 		{Name: "/resume", Description: "Resume the agent", NeedsArg: false},
+		// System instructions commands
+		{Name: "/system", Description: "System prompt: show|set|load|reset|save", NeedsArg: true},
+		// Memory commands
+		{Name: "/summary", Description: "Show operational summary", NeedsArg: false},
+		{Name: "/memory", Description: "Show/reset rolling memory", NeedsArg: false},
 	}
 }
 
@@ -633,6 +638,15 @@ func (m Model) executeCommand(cmd string) (tea.Model, tea.Cmd) {
 		m.engine.Resume()
 		m.streamContent += "\n[Agent resumed]\n"
 
+	case "/system":
+		return m.handleSystemCommand(parts)
+
+	case "/summary":
+		return m.handleSummaryCommand()
+
+	case "/memory":
+		return m.handleMemoryCommand(parts)
+
 	default:
 		m.streamContent += fmt.Sprintf("\n[Unknown command: %s]\n", parts[0])
 	}
@@ -1069,4 +1083,156 @@ func (m Model) filterCommands(input string) []Command {
 	}
 
 	return filtered
+}
+
+// handleSystemCommand handles /system subcommands
+func (m Model) handleSystemCommand(parts []string) (tea.Model, tea.Cmd) {
+	if len(parts) < 2 {
+		m.streamContent += "\n[Usage: /system show|set <text>|load <path>|reset|save]\n"
+		m.streamView.SetContent(m.streamContent)
+		m.streamView.GotoBottom()
+		return m, nil
+	}
+
+	subCmd := parts[1]
+	switch subCmd {
+	case "show":
+		prompt := m.engine.GetEffectiveSystemPrompt()
+		m.streamContent += "\n╔══════════════════════════════════════════════════════════════╗\n"
+		m.streamContent += "║               EFFECTIVE SYSTEM PROMPT                         ║\n"
+		m.streamContent += "╚══════════════════════════════════════════════════════════════╝\n\n"
+		// Truncate if too long for display
+		if len(prompt) > 2000 {
+			m.streamContent += prompt[:2000] + "\n... [truncated, " + fmt.Sprintf("%d", len(prompt)-2000) + " more chars]\n"
+		} else {
+			m.streamContent += prompt + "\n"
+		}
+		m.streamContent += "\n═══════════════════════════════════════════════════════════════\n"
+
+	case "set":
+		if len(parts) < 3 {
+			m.streamContent += "\n[Usage: /system set <instructions text>]\n"
+		} else {
+			text := strings.Join(parts[2:], " ")
+			m.engine.SetSessionInstructions(text)
+			m.streamContent += fmt.Sprintf("\n[Session instructions set (%d chars). Takes effect on next cycle.]\n", len(text))
+		}
+
+	case "load":
+		if len(parts) < 3 {
+			m.streamContent += "\n[Usage: /system load <path>]\n"
+		} else {
+			path := parts[2]
+			if err := m.engine.LoadInstructionsFromFile(path); err != nil {
+				m.streamContent += fmt.Sprintf("\n[ERROR: %v]\n", err)
+			} else {
+				m.streamContent += fmt.Sprintf("\n[Loaded instructions from %s]\n", path)
+			}
+		}
+
+	case "reset":
+		m.engine.ClearSessionInstructions()
+		m.streamContent += "\n[Session instructions cleared. Reverted to base+repo+user layers.]\n"
+
+	case "save":
+		if err := m.engine.SaveSessionInstructions(); err != nil {
+			m.streamContent += fmt.Sprintf("\n[ERROR: %v]\n", err)
+		} else {
+			path := m.engine.PromptManager().UserConfigPath()
+			m.streamContent += fmt.Sprintf("\n[Session instructions saved to %s]\n", path)
+		}
+
+	default:
+		m.streamContent += fmt.Sprintf("\n[Unknown /system subcommand: %s. Use: show|set|load|reset|save]\n", subCmd)
+	}
+
+	m.streamView.SetContent(m.streamContent)
+	m.streamView.GotoBottom()
+	return m, nil
+}
+
+// handleSummaryCommand handles /summary command
+func (m Model) handleSummaryCommand() (tea.Model, tea.Cmd) {
+	summary := m.engine.GetSummary()
+
+	m.streamContent += "\n╔══════════════════════════════════════════════════════════════╗\n"
+	m.streamContent += "║                   OPERATIONAL SUMMARY                        ║\n"
+	m.streamContent += "╚══════════════════════════════════════════════════════════════╝\n\n"
+
+	m.streamContent += fmt.Sprintf("  Goal:        %s\n", summary.CurrentGoal)
+	m.streamContent += fmt.Sprintf("  Objective:   %s\n", summary.CurrentObjective)
+	m.streamContent += fmt.Sprintf("  State:       %s\n", summary.CurrentState)
+	m.streamContent += fmt.Sprintf("  Cycle:       %d\n", summary.CycleCount)
+	m.streamContent += fmt.Sprintf("  Branch:      %s\n", summary.CurrentBranch)
+
+	if summary.IsPaused {
+		m.streamContent += "  Status:      PAUSED\n"
+	} else {
+		m.streamContent += "  Status:      RUNNING\n"
+	}
+
+	if summary.LastVerificationOK {
+		m.streamContent += "  Last Verify: PASSED\n"
+	} else {
+		m.streamContent += "  Last Verify: FAILED\n"
+	}
+
+	if summary.ErrorCount > 0 {
+		m.streamContent += fmt.Sprintf("  Errors:      %d (last: %s)\n", summary.ErrorCount, truncate(summary.LastError, 40))
+	}
+
+	if len(summary.DirtyFiles) > 0 {
+		m.streamContent += fmt.Sprintf("\n  Dirty Files: %d\n", len(summary.DirtyFiles))
+		for i, f := range summary.DirtyFiles {
+			if i >= 5 {
+				m.streamContent += fmt.Sprintf("    ... and %d more\n", len(summary.DirtyFiles)-5)
+				break
+			}
+			m.streamContent += fmt.Sprintf("    - %s\n", f)
+		}
+	}
+
+	if len(summary.BacklogItems) > 0 {
+		m.streamContent += "\n  Backlog:\n"
+		for _, item := range summary.BacklogItems {
+			m.streamContent += fmt.Sprintf("    - %s\n", truncate(item, 50))
+		}
+	}
+
+	m.streamContent += "\n═══════════════════════════════════════════════════════════════\n"
+
+	m.streamView.SetContent(m.streamContent)
+	m.streamView.GotoBottom()
+	return m, nil
+}
+
+// handleMemoryCommand handles /memory command
+func (m Model) handleMemoryCommand(parts []string) (tea.Model, tea.Cmd) {
+	if len(parts) >= 2 && parts[1] == "reset" {
+		m.engine.ResetMemory()
+		m.streamContent += "\n[Working memory reset. Logs preserved on disk.]\n"
+		m.streamView.SetContent(m.streamContent)
+		m.streamView.GotoBottom()
+		return m, nil
+	}
+
+	// Show current memory
+	memText := m.engine.GetWorkingMemory()
+
+	m.streamContent += "\n╔══════════════════════════════════════════════════════════════╗\n"
+	m.streamContent += "║                   WORKING MEMORY                             ║\n"
+	m.streamContent += "╚══════════════════════════════════════════════════════════════╝\n\n"
+
+	if memText == "" {
+		m.streamContent += "  [No working memory yet - will populate after a few cycles]\n"
+	} else {
+		m.streamContent += memText + "\n"
+	}
+
+	m.streamContent += "\n  Use /memory reset to clear (logs preserved on disk)\n"
+	m.streamContent += "═══════════════════════════════════════════════════════════════\n"
+
+	m.streamView.SetContent(m.streamContent)
+	m.streamView.GotoBottom()
+	return m, nil
 }
