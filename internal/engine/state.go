@@ -448,51 +448,12 @@ func (e *Engine) runCycle(ctx context.Context) error {
 	// Add assistant response to conversation
 	e.messages = append(e.messages, response.Message)
 
-	// Phase 3: Execute tool calls
-	if len(response.Message.ToolCalls) > 0 {
-		e.setState(StateExecuting)
-		for _, tc := range response.Message.ToolCalls {
-			result, err := e.executeToolCall(ctx, tc)
-			if err != nil {
-				e.sendUpdate(CycleUpdate{State: StateExecuting, Error: err, ToolResult: result})
-			} else {
-				e.sendUpdate(CycleUpdate{State: StateExecuting, ToolResult: result})
-			}
-
-			// Add tool result to conversation
-			e.messages = append(e.messages, ollama.Message{
-				Role:    "tool",
-				Content: result.Output,
-			})
-		}
-	}
-
-	// Phase 4: Verify
-	e.setState(StateVerifying)
-	verifyResult := e.verifier.QuickCheck(ctx)
-	e.sendUpdate(CycleUpdate{
-		State:   StateVerifying,
-		Message: fmt.Sprintf("Verification %s (%.2fs)", boolToStatus(verifyResult.Success), verifyResult.Duration.Seconds()),
-	})
-
-	if !verifyResult.Success {
-		// Add failure to conversation for the model to handle
-		e.messages = append(e.messages, ollama.Message{
-			Role:    "user",
-			Content: fmt.Sprintf("VERIFICATION FAILED:\n%s\n\nPlease fix the issue.", verifyResult.Output),
-		})
-		return nil // Let the model handle it in the next cycle
-	}
-
-	// Phase 5: Checkpoint
-	e.setState(StateCommitting)
-	if err := e.createCheckpoint(ctx, e.objective); err != nil {
-		e.sendUpdate(CycleUpdate{State: StateCommitting, Error: err})
-	}
-
-	// Update summary and trim context
-	e.updateSummary()
+	// Trim context to avoid growing too large
 	e.trimContext()
+
+	// Wait before next cycle
+	e.sendUpdate(CycleUpdate{State: StateObserving, Message: "Cycle complete. Waiting 5s..."})
+	time.Sleep(5 * time.Second)
 
 	return nil
 }
