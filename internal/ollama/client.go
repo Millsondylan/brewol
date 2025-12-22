@@ -55,11 +55,9 @@ type ToolDef struct {
 
 // ChatRequest represents a chat API request
 type ChatRequest struct {
-	Model     string    `json:"model"`
-	Messages  []Message `json:"messages"`
-	Stream    bool      `json:"stream"`
-	Tools     []Tool    `json:"tools,omitempty"`
-	KeepAlive int       `json:"keep_alive,omitempty"`
+	Model    string    `json:"model"`
+	Messages []Message `json:"messages"`
+	Stream   bool      `json:"stream"`
 }
 
 // ChatResponse represents a streaming chat response chunk
@@ -182,17 +180,33 @@ func (c *Client) ChatStream(ctx context.Context, messages []Message, tools []Too
 		return nil, fmt.Errorf("no model selected; use SetModel() or set OLLAMA_MODEL")
 	}
 
+	// Keep messages minimal - truncate content if too long
+	var trimmedMessages []Message
+	for _, m := range messages {
+		content := m.Content
+		if len(content) > 2000 {
+			content = content[:2000] + "..."
+		}
+		trimmedMessages = append(trimmedMessages, Message{
+			Role:    m.Role,
+			Content: content,
+		})
+	}
+
 	chatReq := ChatRequest{
-		Model:     model,
-		Messages:  messages,
-		Stream:    true,
-		Tools:     tools,
-		KeepAlive: -1, // Keep model hot
+		Model:    model,
+		Messages: trimmedMessages,
+		Stream:   true,
 	}
 
 	body, err := json.Marshal(chatReq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// Log request size for debugging
+	if len(body) > 10000 {
+		return nil, fmt.Errorf("request too large (%d bytes), reduce context", len(body))
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/chat", bytes.NewReader(body))
@@ -284,11 +298,9 @@ func (c *Client) Chat(ctx context.Context, messages []Message, tools []Tool) (*C
 	}
 
 	chatReq := ChatRequest{
-		Model:     model,
-		Messages:  messages,
-		Stream:    false,
-		Tools:     tools,
-		KeepAlive: -1,
+		Model:    model,
+		Messages: messages,
+		Stream:   false,
 	}
 
 	body, err := json.Marshal(chatReq)
@@ -325,71 +337,6 @@ func (c *Client) Chat(ctx context.Context, messages []Message, tools []Tool) (*C
 	return &chatResp, nil
 }
 
-// Preload sends a keep_alive request to load a model
-func (c *Client) Preload(ctx context.Context, model string) error {
-	chatReq := ChatRequest{
-		Model:     model,
-		Messages:  []Message{{Role: "user", Content: ""}},
-		Stream:    false,
-		KeepAlive: -1,
-	}
-
-	body, err := json.Marshal(chatReq)
-	if err != nil {
-		return fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/chat", bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to send request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	return nil
-}
-
-// Unload sends a keep_alive: 0 request to unload a model
-func (c *Client) Unload(ctx context.Context, model string) error {
-	chatReq := ChatRequest{
-		Model:     model,
-		Messages:  []Message{{Role: "user", Content: ""}},
-		Stream:    false,
-		KeepAlive: 0,
-	}
-
-	body, err := json.Marshal(chatReq)
-	if err != nil {
-		return fmt.Errorf("failed to marshal request: %w", err)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, "POST", c.baseURL+"/api/chat", bytes.NewReader(body))
-	if err != nil {
-		return fmt.Errorf("failed to create request: %w", err)
-	}
-
-	req.Header.Set("Content-Type", "application/json")
-	if c.apiKey != "" {
-		req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	}
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return fmt.Errorf("failed to send request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	return nil
-}
 
 // IsAvailable checks if Ollama is reachable
 func (c *Client) IsAvailable(ctx context.Context) bool {

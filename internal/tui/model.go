@@ -104,15 +104,20 @@ type Model struct {
 	toolLogView   viewport.Model
 	backlogView   viewport.Model
 	commandInput  textinput.Model
+	promptInput   textinput.Model
 	width         int
 	height        int
-	streamContent strings.Builder
+	streamContent string
 	toolLogs      []ToolLogEntry
 	suggestions   []engine.Suggestion
 	showHelp      bool
 	showDiff      bool
 	showCommand   bool
 	showModels    bool
+	inputFocused  bool
+	showCmdList   bool
+	filteredCmds  []Command
+	selectedCmd   int
 	models        []ollama.ModelInfo
 	selectedModel int
 	tokensPerSec  float64
@@ -132,6 +137,31 @@ type ToolLogEntry struct {
 	Time     time.Time
 }
 
+// Command represents an available command
+type Command struct {
+	Name        string
+	Description string
+	NeedsArg    bool
+}
+
+// AvailableCommands returns all available slash commands
+func AvailableCommands() []Command {
+	return []Command{
+		{Name: "/goal", Description: "Set a new goal for the agent", NeedsArg: true},
+		{Name: "/model", Description: "Switch to a different model", NeedsArg: false},
+		{Name: "/models", Description: "Open model picker", NeedsArg: false},
+		{Name: "/test", Description: "Test current model connection", NeedsArg: false},
+		{Name: "/status", Description: "Show current status", NeedsArg: false},
+		{Name: "/checkpoint", Description: "Create a git checkpoint", NeedsArg: false},
+		{Name: "/rollback", Description: "Rollback to last checkpoint", NeedsArg: false},
+		{Name: "/speed", Description: "Set throttle speed (0=none)", NeedsArg: true},
+		{Name: "/help", Description: "Show help", NeedsArg: false},
+		{Name: "/clear", Description: "Clear the output", NeedsArg: false},
+		{Name: "/pause", Description: "Pause the agent", NeedsArg: false},
+		{Name: "/resume", Description: "Resume the agent", NeedsArg: false},
+	}
+}
+
 // New creates a new TUI model
 func New(eng *engine.Engine) Model {
 	s := spinner.New()
@@ -142,12 +172,19 @@ func New(eng *engine.Engine) Model {
 	ti.Placeholder = "Enter command..."
 	ti.CharLimit = 256
 
+	pi := textinput.New()
+	pi.Placeholder = "Enter goal or prompt... (press Enter to send, Tab to unfocus)"
+	pi.CharLimit = 1024
+	pi.Focus()
+
 	return Model{
 		engine:       eng,
 		keyMap:       DefaultKeyMap(),
 		help:         help.New(),
 		spinner:      s,
 		commandInput: ti,
+		promptInput:  pi,
+		inputFocused: true,
 	}
 }
 
@@ -157,6 +194,7 @@ func (m Model) Init() tea.Cmd {
 		m.spinner.Tick,
 		m.listenForUpdates(),
 		m.fetchModels(),
+		textinput.Blink,
 	)
 }
 
@@ -169,6 +207,14 @@ type engineUpdateMsg struct {
 type modelsLoadedMsg struct {
 	models []ollama.ModelInfo
 	err    error
+}
+
+// modelTestMsg carries the result of a model test
+type modelTestMsg struct {
+	model   string
+	success bool
+	message string
+	err     error
 }
 
 func (m Model) listenForUpdates() tea.Cmd {
@@ -188,6 +234,33 @@ func (m Model) fetchModels() tea.Cmd {
 
 		models, err := m.engine.Client().ListModels(ctx)
 		return modelsLoadedMsg{models: models, err: err}
+	}
+}
+
+func (m Model) testModel() tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		model := m.engine.Client().GetModel()
+		messages := []ollama.Message{
+			{Role: "user", Content: "Say 'Hello' in one word."},
+		}
+
+		resp, err := m.engine.Client().Chat(ctx, messages, nil)
+		if err != nil {
+			return modelTestMsg{
+				model:   model,
+				success: false,
+				err:     err,
+			}
+		}
+
+		return modelTestMsg{
+			model:   model,
+			success: true,
+			message: resp.Message.Content,
+		}
 	}
 }
 
@@ -217,7 +290,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case modelsLoadedMsg:
 		if msg.err == nil {
 			m.models = msg.models
+		} else {
+			m.streamContent += fmt.Sprintf("\n[ERROR loading models: %v]\n", msg.err)
+			m.streamView.SetContent(m.streamContent)
 		}
+		return m, nil
+
+	case modelTestMsg:
+		if msg.success {
+			m.streamContent += fmt.Sprintf("\n[Model %s OK! Response: %s]\n", msg.model, strings.TrimSpace(msg.message))
+		} else {
+			m.streamContent += fmt.Sprintf("\n[ERROR: Model %s failed: %v]\n", msg.model, msg.err)
+		}
+		m.streamView.SetContent(m.streamContent)
+		m.streamView.GotoBottom()
 		return m, nil
 	}
 
@@ -256,13 +342,22 @@ func (m Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "esc":
 			m.showModels = false
-			return m, nil
+			m.inputFocused = true
+			m.promptInput.Focus()
+			m.streamContent += "[Model picker cancelled]\n"
+			m.streamView.SetContent(m.streamContent)
+			return m, textinput.Blink
 		case "enter":
 			if m.selectedModel < len(m.models) {
-				m.engine.Client().SetModel(m.models[m.selectedModel].Name)
+				selectedName := m.models[m.selectedModel].Name
+				m.engine.Client().SetModel(selectedName)
+				m.streamContent += fmt.Sprintf("[Model changed to: %s]\n", selectedName)
+				m.streamView.SetContent(m.streamContent)
 			}
 			m.showModels = false
-			return m, nil
+			m.inputFocused = true
+			m.promptInput.Focus()
+			return m, textinput.Blink
 		case "up", "k":
 			if m.selectedModel > 0 {
 				m.selectedModel--
@@ -275,6 +370,109 @@ func (m Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		return m, nil
+	}
+
+	// Handle prompt input when focused
+	if m.inputFocused {
+		input := m.promptInput.Value()
+
+		// Check if we should show command list
+		if strings.HasPrefix(input, "/") {
+			m.showCmdList = true
+			m.filteredCmds = m.filterCommands(input)
+		} else {
+			m.showCmdList = false
+			m.selectedCmd = 0
+		}
+
+		switch msg.String() {
+		case "esc":
+			m.inputFocused = false
+			m.showCmdList = false
+			m.promptInput.Blur()
+			return m, nil
+		case "tab":
+			// Autocomplete selected command
+			if m.showCmdList && len(m.filteredCmds) > 0 {
+				cmd := m.filteredCmds[m.selectedCmd]
+				if cmd.NeedsArg {
+					m.promptInput.SetValue(cmd.Name + " ")
+					m.promptInput.SetCursor(len(cmd.Name) + 1)
+				} else {
+					m.promptInput.SetValue(cmd.Name)
+					m.promptInput.SetCursor(len(cmd.Name))
+				}
+				m.filteredCmds = m.filterCommands(m.promptInput.Value())
+				return m, nil
+			}
+			m.inputFocused = false
+			m.showCmdList = false
+			m.promptInput.Blur()
+			return m, nil
+		case "up":
+			if m.showCmdList && len(m.filteredCmds) > 0 {
+				if m.selectedCmd > 0 {
+					m.selectedCmd--
+				} else {
+					m.selectedCmd = len(m.filteredCmds) - 1
+				}
+				return m, nil
+			}
+			return m, nil
+		case "down":
+			if m.showCmdList && len(m.filteredCmds) > 0 {
+				if m.selectedCmd < len(m.filteredCmds)-1 {
+					m.selectedCmd++
+				} else {
+					m.selectedCmd = 0
+				}
+				return m, nil
+			}
+			return m, nil
+		case "enter":
+			// If command list is showing, execute the SELECTED command
+			if m.showCmdList && len(m.filteredCmds) > 0 {
+				selectedCmd := m.filteredCmds[m.selectedCmd]
+				m.promptInput.Reset()
+				m.showCmdList = false
+				m.selectedCmd = 0
+				m.inputFocused = false
+				m.promptInput.Blur()
+				return m.executeCommand(selectedCmd.Name)
+			}
+
+			// Otherwise use input value
+			inputVal := m.promptInput.Value()
+			m.promptInput.Reset()
+			m.showCmdList = false
+			m.selectedCmd = 0
+
+			if strings.HasPrefix(inputVal, "/") {
+				m.inputFocused = false
+				m.promptInput.Blur()
+				return m.executeCommand(inputVal)
+			} else if inputVal != "" {
+				// Set as goal
+				m.engine.SetGoal(inputVal)
+				m.streamContent += fmt.Sprintf("\n[Goal set: %s]\n", inputVal)
+				m.streamView.SetContent(m.streamContent)
+				m.streamView.GotoBottom()
+			}
+			return m, nil
+		default:
+			var cmd tea.Cmd
+			m.promptInput, cmd = m.promptInput.Update(msg)
+			// Update filtered commands after input changes
+			newInput := m.promptInput.Value()
+			if strings.HasPrefix(newInput, "/") {
+				m.showCmdList = true
+				m.filteredCmds = m.filterCommands(newInput)
+				m.selectedCmd = 0
+			} else {
+				m.showCmdList = false
+			}
+			return m, cmd
+		}
 	}
 
 	// Normal mode keybindings
@@ -298,13 +496,18 @@ func (m Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case key.Matches(msg, m.keyMap.OpenLogs):
 		// Display log path
-		m.streamContent.WriteString(fmt.Sprintf("\n[Logs: %s]\n", m.engine.Session().Path()))
-		m.streamView.SetContent(m.streamContent.String())
+		m.streamContent += fmt.Sprintf("\n[Logs: %s]\n", m.engine.Session().Path())
+		m.streamView.SetContent(m.streamContent)
 		m.streamView.GotoBottom()
 		return m, nil
 
 	case key.Matches(msg, m.keyMap.Help):
 		m.showHelp = !m.showHelp
+		if !m.showHelp {
+			m.inputFocused = true
+			m.promptInput.Focus()
+			return m, textinput.Blink
+		}
 		return m, nil
 
 	case key.Matches(msg, m.keyMap.ScrollUp):
@@ -324,7 +527,12 @@ func (m Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	return m, nil
+	// If any other key is pressed, focus the input
+	m.inputFocused = true
+	m.promptInput.Focus()
+	var cmd tea.Cmd
+	m.promptInput, cmd = m.promptInput.Update(msg)
+	return m, tea.Batch(cmd, textinput.Blink)
 }
 
 func (m Model) handleEscape() (tea.Model, tea.Cmd) {
@@ -341,8 +549,8 @@ func (m Model) handleEscape() (tea.Model, tea.Cmd) {
 
 	// Single ESC: cancel current operation
 	m.engine.CancelCurrent()
-	m.streamContent.WriteString("\n[Operation cancelled]\n")
-	m.streamView.SetContent(m.streamContent.String())
+	m.streamContent += "\n[Operation cancelled]\n"
+	m.streamView.SetContent(m.streamContent)
 	m.streamView.GotoBottom()
 
 	return m, nil
@@ -359,48 +567,77 @@ func (m Model) executeCommand(cmd string) (tea.Model, tea.Cmd) {
 		if len(parts) > 1 {
 			goal := strings.Join(parts[1:], " ")
 			m.engine.SetGoal(goal)
-			m.streamContent.WriteString(fmt.Sprintf("\n[Goal set: %s]\n", goal))
+			m.streamContent += fmt.Sprintf("\n[Goal set: %s]\n", goal)
+		} else {
+			m.streamContent += "\n[Usage: /goal <your goal>]\n"
 		}
 
-	case "/model", "/m":
-		if len(parts) > 1 {
-			m.engine.Client().SetModel(parts[1])
-			m.streamContent.WriteString(fmt.Sprintf("\n[Model switched to: %s]\n", parts[1]))
-		}
-
-	case "/models":
+	case "/model", "/m", "/models":
+		// Always open model picker - user can select from list
 		m.showModels = true
+		m.streamContent += "\n[Opening model picker...]\n"
+		m.streamView.SetContent(m.streamContent)
+		m.streamView.GotoBottom()
 		return m, m.fetchModels()
+
+	case "/test":
+		model := m.engine.Client().GetModel()
+		if model == "" {
+			m.streamContent += "\n[ERROR: No model selected. Use /model first]\n"
+		} else {
+			m.streamContent += fmt.Sprintf("\n[Testing model: %s...]\n", model)
+			m.streamView.SetContent(m.streamContent)
+			return m, m.testModel()
+		}
 
 	case "/status", "/s":
 		state := m.engine.GetState()
 		objective := m.engine.GetObjective()
-		m.streamContent.WriteString(fmt.Sprintf("\n[Status: %s | Objective: %s]\n", state, objective))
+		model := m.engine.Client().GetModel()
+		paused := ""
+		if m.engine.IsPaused() {
+			paused = " (PAUSED)"
+		}
+		m.streamContent += fmt.Sprintf("\n[Status: %s%s | Model: %s | Objective: %s]\n", state, paused, model, objective)
 
 	case "/checkpoint", "/cp":
 		go m.engine.Checkpoint(context.Background())
-		m.streamContent.WriteString("\n[Creating checkpoint...]\n")
+		m.streamContent += "\n[Creating checkpoint...]\n"
 
 	case "/rollback", "/rb":
 		go m.engine.Rollback(context.Background())
-		m.streamContent.WriteString("\n[Rolling back...]\n")
+		m.streamContent += "\n[Rolling back...]\n"
 
 	case "/speed":
 		if len(parts) > 1 {
 			var speed int
 			fmt.Sscanf(parts[1], "%d", &speed)
 			m.engine.SetSpeed(speed)
-			m.streamContent.WriteString(fmt.Sprintf("\n[Speed set to: %d]\n", speed))
+			m.streamContent += fmt.Sprintf("\n[Speed set to: %d]\n", speed)
+		} else {
+			m.streamContent += "\n[Usage: /speed <0-10> (0=no throttle)]\n"
 		}
 
 	case "/help", "/h", "/?":
 		m.showHelp = true
 
+	case "/clear":
+		m.streamContent = ""
+		m.toolLogs = nil
+
+	case "/pause":
+		m.engine.Pause()
+		m.streamContent += "\n[Agent paused]\n"
+
+	case "/resume":
+		m.engine.Resume()
+		m.streamContent += "\n[Agent resumed]\n"
+
 	default:
-		m.streamContent.WriteString(fmt.Sprintf("\n[Unknown command: %s]\n", parts[0]))
+		m.streamContent += fmt.Sprintf("\n[Unknown command: %s]\n", parts[0])
 	}
 
-	m.streamView.SetContent(m.streamContent.String())
+	m.streamView.SetContent(m.streamContent)
 	m.streamView.GotoBottom()
 
 	return m, nil
@@ -409,12 +646,12 @@ func (m Model) executeCommand(cmd string) (tea.Model, tea.Cmd) {
 func (m Model) handleEngineUpdate(update engine.CycleUpdate) Model {
 	// Update state display
 	if update.Message != "" {
-		m.streamContent.WriteString(fmt.Sprintf("[%s] %s\n", update.State, update.Message))
+		m.streamContent += fmt.Sprintf("[%s] %s\n", update.State, update.Message)
 	}
 
 	// Handle streaming tokens
 	if update.TokenContent != "" {
-		m.streamContent.WriteString(update.TokenContent)
+		m.streamContent += update.TokenContent
 		m.tokensPerSec = update.TokensPerSec
 	}
 
@@ -446,10 +683,10 @@ func (m Model) handleEngineUpdate(update engine.CycleUpdate) Model {
 	// Handle errors
 	if update.Error != nil {
 		m.err = update.Error
-		m.streamContent.WriteString(fmt.Sprintf("\n[ERROR] %v\n", update.Error))
+		m.streamContent += fmt.Sprintf("\n[ERROR] %v\n", update.Error)
 	}
 
-	m.streamView.SetContent(m.streamContent.String())
+	m.streamView.SetContent(m.streamContent)
 	m.streamView.GotoBottom()
 
 	return m
@@ -457,7 +694,7 @@ func (m Model) handleEngineUpdate(update engine.CycleUpdate) Model {
 
 func (m *Model) updateViewports() {
 	headerHeight := 3
-	footerHeight := 2
+	footerHeight := 5 // Prompt input + status line
 	contentHeight := m.height - headerHeight - footerHeight
 
 	// Calculate widths
@@ -470,7 +707,7 @@ func (m *Model) updateViewports() {
 
 	// Stream view (main content)
 	m.streamView = viewport.New(mainWidth, contentHeight-10)
-	m.streamView.SetContent(m.streamContent.String())
+	m.streamView.SetContent(m.streamContent)
 
 	// Tool log view
 	m.toolLogView = viewport.New(mainWidth, 8)
@@ -690,31 +927,39 @@ Press ? to close this help`
 
 func (m Model) renderModelPicker() string {
 	pickerStyle := lipgloss.NewStyle().
-		Border(lipgloss.RoundedBorder()).
-		BorderForeground(lipgloss.Color("62")).
+		Border(lipgloss.DoubleBorder()).
+		BorderForeground(lipgloss.Color("205")).
+		Background(lipgloss.Color("235")).
 		Padding(1, 2).
 		Width(m.width - 4)
 
 	var content strings.Builder
-	content.WriteString("SELECT MODEL:\n\n")
+	content.WriteString("╔══════════════════════════════════════╗\n")
+	content.WriteString("║         SELECT OLLAMA MODEL          ║\n")
+	content.WriteString("╚══════════════════════════════════════╝\n\n")
 
-	currentModel := m.engine.Client().GetModel()
+	if len(m.models) == 0 {
+		content.WriteString("  Loading models...\n")
+		content.WriteString("  (Make sure Ollama is running)\n")
+	} else {
+		currentModel := m.engine.Client().GetModel()
 
-	for i, model := range m.models {
-		cursor := "  "
-		if i == m.selectedModel {
-			cursor = "> "
+		for i, model := range m.models {
+			cursor := "  "
+			if i == m.selectedModel {
+				cursor = "> "
+			}
+
+			current := ""
+			if model.Name == currentModel {
+				current = " ← current"
+			}
+
+			content.WriteString(fmt.Sprintf("%s%s%s\n", cursor, model.Name, current))
 		}
-
-		current := ""
-		if model.Name == currentModel {
-			current = " (current)"
-		}
-
-		content.WriteString(fmt.Sprintf("%s%s%s\n", cursor, model.Name, current))
 	}
 
-	content.WriteString("\n↑/↓ to navigate, Enter to select, ESC to cancel")
+	content.WriteString("\n↑/↓ navigate | Enter select | ESC cancel")
 
 	return pickerStyle.Render(content.String())
 }
@@ -730,6 +975,47 @@ func (m Model) renderCommandInput() string {
 }
 
 func (m Model) renderFooter() string {
+	var b strings.Builder
+
+	// Command autocomplete dropdown (above input)
+	if m.showCmdList && len(m.filteredCmds) > 0 {
+		cmdListStyle := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("62")).
+			Padding(0, 1).
+			Width(m.width - 4)
+
+		var cmdContent strings.Builder
+		for i, cmd := range m.filteredCmds {
+			cursor := "  "
+			if i == m.selectedCmd {
+				cursor = "> "
+			}
+			cmdContent.WriteString(fmt.Sprintf("%s%s  %s\n", cursor, cmd.Name, lipgloss.NewStyle().Foreground(lipgloss.Color("241")).Render(cmd.Description)))
+		}
+		cmdContent.WriteString("\n↑/↓ navigate | Tab autocomplete | Enter execute")
+
+		b.WriteString(cmdListStyle.Render(cmdContent.String()))
+		b.WriteString("\n")
+	}
+
+	// Prompt input field
+	inputStyle := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("205")).
+		Padding(0, 1).
+		Width(m.width - 4)
+
+	if m.inputFocused {
+		inputStyle = inputStyle.BorderForeground(lipgloss.Color("205"))
+	} else {
+		inputStyle = inputStyle.BorderForeground(lipgloss.Color("240"))
+	}
+
+	b.WriteString(inputStyle.Render(m.promptInput.View()))
+	b.WriteString("\n")
+
+	// Status line
 	footerStyle := lipgloss.NewStyle().
 		Foreground(lipgloss.Color("241"))
 
@@ -738,8 +1024,14 @@ func (m Model) renderFooter() string {
 		objective = "No current objective"
 	}
 
-	left := fmt.Sprintf("Objective: %s", truncate(objective, 50))
-	right := "ESC ESC to exit | ? for help"
+	// Show paused state if applicable
+	status := ""
+	if m.engine.IsPaused() {
+		status = "[PAUSED] "
+	}
+
+	left := fmt.Sprintf("%sObjective: %s", status, truncate(objective, 50))
+	right := "ESC ESC to exit | Ctrl+M models | ? help"
 
 	leftWidth := len(left)
 	rightWidth := len(right)
@@ -748,7 +1040,9 @@ func (m Model) renderFooter() string {
 		spacing = 1
 	}
 
-	return footerStyle.Render(left + strings.Repeat(" ", spacing) + right)
+	b.WriteString(footerStyle.Render(left + strings.Repeat(" ", spacing) + right))
+
+	return b.String()
 }
 
 func truncate(s string, maxLen int) string {
@@ -756,4 +1050,23 @@ func truncate(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen-3] + "..."
+}
+
+// filterCommands filters commands based on input prefix
+func (m Model) filterCommands(input string) []Command {
+	var filtered []Command
+	input = strings.ToLower(input)
+
+	for _, cmd := range AvailableCommands() {
+		if strings.HasPrefix(strings.ToLower(cmd.Name), input) {
+			filtered = append(filtered, cmd)
+		}
+	}
+
+	// If no matches, return all commands
+	if len(filtered) == 0 && input == "/" {
+		return AvailableCommands()
+	}
+
+	return filtered
 }

@@ -80,22 +80,25 @@ type CycleUpdate struct {
 
 // Engine is the autonomous agent engine
 type Engine struct {
-	client     *ollama.Client
-	tools      *tools.Registry
-	project    *repo.Project
-	verifier   *repo.Verifier
-	session    *logs.Session
-	messages   []ollama.Message
-	backlog    []BacklogItem
-	objective  string
-	state      State
-	summary    string
-	cycleCount int
-	updates    chan CycleUpdate
-	cancel     context.CancelFunc
-	mu         sync.RWMutex
-	goal       string // user-set goal
-	speed      int    // throttle (0 = no throttle)
+	client       *ollama.Client
+	tools        *tools.Registry
+	project      *repo.Project
+	verifier     *repo.Verifier
+	session      *logs.Session
+	messages     []ollama.Message
+	backlog      []BacklogItem
+	objective    string
+	state        State
+	summary      string
+	cycleCount   int
+	updates      chan CycleUpdate
+	cancel       context.CancelFunc
+	mu           sync.RWMutex
+	goal         string // user-set goal
+	speed        int    // throttle (0 = no throttle)
+	paused       bool   // pause flag
+	errorCount   int    // consecutive error count
+	lastError    string // last error message
 }
 
 // Config holds engine configuration
@@ -187,6 +190,27 @@ func (e *Engine) SetSpeed(speed int) {
 	e.mu.Unlock()
 }
 
+// Pause pauses the engine
+func (e *Engine) Pause() {
+	e.mu.Lock()
+	e.paused = true
+	e.mu.Unlock()
+}
+
+// Resume resumes the engine
+func (e *Engine) Resume() {
+	e.mu.Lock()
+	e.paused = false
+	e.mu.Unlock()
+}
+
+// IsPaused returns whether the engine is paused
+func (e *Engine) IsPaused() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.paused
+}
+
 // GetState returns the current state
 func (e *Engine) GetState() State {
 	e.mu.RLock()
@@ -267,6 +291,12 @@ func (e *Engine) run(ctx context.Context) {
 		default:
 		}
 
+		// Check for paused state
+		if e.IsPaused() {
+			time.Sleep(500 * time.Millisecond)
+			continue
+		}
+
 		// Check for throttle
 		e.mu.RLock()
 		speed := e.speed
@@ -281,12 +311,60 @@ func (e *Engine) run(ctx context.Context) {
 				// Context cancelled - restart with fresh context
 				ctx, e.cancel = context.WithCancel(context.Background())
 				e.sendUpdate(CycleUpdate{State: StateObserving, Message: "Operation cancelled, continuing..."})
+				e.errorCount = 0
 				continue
 			}
-			e.sendUpdate(CycleUpdate{State: StateRecovering, Error: err})
-			// Try to recover
-			e.recover(ctx)
+
+			e.mu.Lock()
+			e.errorCount++
+			e.lastError = err.Error()
+			errorCount := e.errorCount
+			e.mu.Unlock()
+
+			// Check for rate limit errors (403, 429, "limit", "quota")
+			errStr := err.Error()
+			isRateLimit := strings.Contains(errStr, "403") ||
+				strings.Contains(errStr, "429") ||
+				strings.Contains(errStr, "limit") ||
+				strings.Contains(errStr, "quota") ||
+				strings.Contains(errStr, "rate")
+
+			if isRateLimit {
+				e.sendUpdate(CycleUpdate{
+					State:   StateRecovering,
+					Error:   err,
+					Message: "RATE LIMITED - Auto-pausing. Use /resume when ready.",
+				})
+				e.Pause()
+				continue
+			}
+
+			// Exponential backoff for other errors
+			if errorCount >= 3 {
+				e.sendUpdate(CycleUpdate{
+					State:   StateRecovering,
+					Error:   err,
+					Message: fmt.Sprintf("Too many errors (%d). Auto-pausing. Use /resume to retry.", errorCount),
+				})
+				e.Pause()
+				continue
+			}
+
+			// Backoff before retry
+			backoff := time.Duration(errorCount*errorCount) * time.Second
+			e.sendUpdate(CycleUpdate{
+				State:   StateRecovering,
+				Error:   err,
+				Message: fmt.Sprintf("Error %d/3. Retrying in %v...", errorCount, backoff),
+			})
+			time.Sleep(backoff)
+			continue
 		}
+
+		// Success - reset error count
+		e.mu.Lock()
+		e.errorCount = 0
+		e.mu.Unlock()
 
 		e.cycleCount++
 	}
@@ -306,41 +384,9 @@ func (e *Engine) initializeSession(ctx context.Context) {
 }
 
 func (e *Engine) buildSystemPrompt() {
-	systemPrompt := fmt.Sprintf(`You are an autonomous coding agent operating in AUTOPILOT mode.
-
-WORKSPACE: %s
-PROJECT TYPE: %s
-TEST COMMAND: %s
-BUILD COMMAND: %s
-
-You have access to tools for filesystem operations, code search, shell execution, and git.
-
-CRITICAL RULES:
-1. NEVER pause or wait for user input - you are fully autonomous
-2. Execute tool calls immediately without seeking approval
-3. After each action, verify the result and continue with the next logical step
-4. Always run verification after making changes
-5. Create checkpoint commits after completing objectives
-
-Your response MUST include a SUGGESTIONS block in this format:
-SUGGESTIONS:
-Item description — STATUS (EXECUTING|QUEUED|SKIPPED)
-If SKIPPED, include reason: Item — SKIPPED (reason)
-
-For each cycle:
-1. Observe the current state
-2. Decide on the highest-value action
-3. Execute tool calls
-4. Verify changes work
-5. Commit checkpoint
-6. Repeat
-
-Available tools: %s`,
+	systemPrompt := fmt.Sprintf(`You are an autonomous coding agent. Project: %s (%s). Be concise.`,
 		e.project.Root,
 		e.project.Type,
-		e.project.TestCommand,
-		e.project.BuildCommand,
-		strings.Join(e.tools.List(), ", "),
 	)
 
 	e.messages = []ollama.Message{
@@ -349,6 +395,18 @@ Available tools: %s`,
 }
 
 func (e *Engine) runCycle(ctx context.Context) error {
+	// Wait for a goal before doing anything
+	e.mu.RLock()
+	goal := e.goal
+	e.mu.RUnlock()
+
+	if goal == "" {
+		e.setState(StateObserving)
+		e.sendUpdate(CycleUpdate{State: StateObserving, Message: "Waiting for goal... Use /goal <your goal>"})
+		time.Sleep(2 * time.Second)
+		return nil
+	}
+
 	// Phase 1: Observe
 	e.setState(StateObserving)
 	observation, err := e.observe(ctx)
@@ -426,72 +484,22 @@ func (e *Engine) runCycle(ctx context.Context) error {
 }
 
 func (e *Engine) observe(ctx context.Context) (string, error) {
-	var observations []string
-
-	// Get git status
-	statusResult, _ := e.tools.Execute(ctx, "git_status", json.RawMessage(`{}`))
-	if statusResult != nil && statusResult.Output != "" {
-		observations = append(observations, "GIT STATUS:\n"+statusResult.Output)
-	}
-
-	// Get recent changes
-	diffResult, _ := e.tools.Execute(ctx, "git_diff", json.RawMessage(`{}`))
-	if diffResult != nil && diffResult.Output != "" && diffResult.Output != "No changes" {
-		observations = append(observations, "RECENT CHANGES:\n"+diffResult.Output)
-	}
-
-	// Scan for TODOs if backlog is low
-	if len(e.backlog) < 5 {
-		e.refreshBacklog(ctx)
-	}
-
-	// Add backlog info
-	if len(e.backlog) > 0 {
-		var backlogStr strings.Builder
-		backlogStr.WriteString("BACKLOG:\n")
-		for i, item := range e.backlog {
-			if i >= 10 {
-				break
-			}
-			backlogStr.WriteString(fmt.Sprintf("%d. [P%d] %s (%s)\n", i+1, item.Priority, item.Description, item.Source))
-		}
-		observations = append(observations, backlogStr.String())
-	}
-
-	// Add user goal if set
+	// Keep observations minimal to avoid entity too large errors
 	e.mu.RLock()
 	goal := e.goal
 	e.mu.RUnlock()
+
 	if goal != "" {
-		observations = append(observations, "USER GOAL: "+goal)
+		return fmt.Sprintf("Goal: %s\nWhat should I do first?", goal), nil
 	}
 
-	// Add rolling summary if exists
-	if e.summary != "" {
-		observations = append(observations, "SESSION SUMMARY:\n"+e.summary)
-	}
-
-	return strings.Join(observations, "\n\n"), nil
+	return "No goal set. Waiting for instructions.", nil
 }
 
 func (e *Engine) decide(ctx context.Context) (*ollama.ChatResponse, error) {
-	prompt := `Based on the current state:
-1. Pick the highest-value task from the backlog (or identify a new one)
-2. Plan the implementation with specific tool calls
-3. Define success criteria
-4. Define rollback strategy if it fails
-
-Remember to include SUGGESTIONS block.
-
-What will you do now?`
-
-	e.messages = append(e.messages, ollama.Message{
-		Role:    "user",
-		Content: prompt,
-	})
-
-	// Stream the response
-	stream, err := e.client.ChatStream(ctx, e.messages, e.tools.ToOllamaTools())
+	// Don't add extra prompts - just use what's in messages
+	// Stream the response WITHOUT tools to avoid entity too large
+	stream, err := e.client.ChatStream(ctx, e.messages, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -675,27 +683,19 @@ func (e *Engine) updateSummary() {
 }
 
 func (e *Engine) trimContext() {
-	// Keep system message + last N turns + summary
-	const maxTurns = 20
+	// Keep only system message + last 4 messages to avoid entity too large
+	const maxMessages = 5
 
-	if len(e.messages) <= maxTurns {
+	if len(e.messages) <= maxMessages {
 		return
 	}
 
-	// Keep system message (first) and last maxTurns-1 messages
-	newMessages := make([]ollama.Message, 0, maxTurns)
+	// Keep system message (first) and last few messages
+	newMessages := make([]ollama.Message, 0, maxMessages)
 	newMessages = append(newMessages, e.messages[0]) // system message
 
-	// Add summary if available
-	if e.summary != "" {
-		newMessages = append(newMessages, ollama.Message{
-			Role:    "user",
-			Content: "[Session Summary]\n" + e.summary,
-		})
-	}
-
 	// Add last messages
-	startIdx := len(e.messages) - (maxTurns - 2)
+	startIdx := len(e.messages) - (maxMessages - 1)
 	if startIdx < 1 {
 		startIdx = 1
 	}
@@ -708,17 +708,25 @@ func (e *Engine) recover(ctx context.Context) {
 	e.setState(StateRecovering)
 	e.sendUpdate(CycleUpdate{State: StateRecovering, Message: "Attempting recovery..."})
 
-	// Try to rollback
-	if tools.IsGitRepo(e.project.Root) {
-		e.tools.Execute(ctx, "git_reset_hard", json.RawMessage(`{"ref": "HEAD~1"}`))
-	}
+	// Only do git reset if there are actual uncommitted changes from a failed operation
+	// Don't reset on API errors
+	e.mu.RLock()
+	lastErr := e.lastError
+	e.mu.RUnlock()
 
-	// Pop the current item from backlog and try the next one
-	e.mu.Lock()
-	if len(e.backlog) > 0 {
-		e.backlog = e.backlog[1:]
+	isAPIError := strings.Contains(lastErr, "API error") ||
+		strings.Contains(lastErr, "403") ||
+		strings.Contains(lastErr, "429") ||
+		strings.Contains(lastErr, "limit")
+
+	if !isAPIError && tools.IsGitRepo(e.project.Root) {
+		// Check if there are uncommitted changes before resetting
+		dirtyFiles := tools.GetDirtyFiles(e.project.Root)
+		if len(dirtyFiles) > 0 {
+			e.sendUpdate(CycleUpdate{State: StateRecovering, Message: "Rolling back uncommitted changes..."})
+			e.tools.Execute(ctx, "git_reset_hard", json.RawMessage(`{"ref": "HEAD"}`))
+		}
 	}
-	e.mu.Unlock()
 }
 
 func (e *Engine) setState(state State) {
