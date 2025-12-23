@@ -66,13 +66,15 @@ fi
 # Make executable
 chmod +x "$TMP_DIR/brewol"
 
+# Create install directory if needed
+mkdir -p "$INSTALL_DIR" 2>/dev/null || true
+
 # Install to system
-if [ -w "$INSTALL_DIR" ]; then
-  mv "$TMP_DIR/brewol" "$INSTALL_DIR/brewol"
+if cp "$TMP_DIR/brewol" "$INSTALL_DIR/brewol" 2>/dev/null; then
   echo "✓ Installed to $INSTALL_DIR/brewol"
 else
   echo "Installing to $INSTALL_DIR requires sudo..."
-  sudo mv "$TMP_DIR/brewol" "$INSTALL_DIR/brewol"
+  sudo cp "$TMP_DIR/brewol" "$INSTALL_DIR/brewol"
   echo "✓ Installed to $INSTALL_DIR/brewol"
 fi
 
