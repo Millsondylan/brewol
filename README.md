@@ -1,3 +1,6 @@
+-e hi
+hi
+hi
 # brewol
 
 An autonomous terminal-based coding agent that **never stops working**. It continuously plans, executes, and verifies changes to your codebase using local LLMs via Ollama.
@@ -237,17 +240,67 @@ go build ./cmd/brewol
 ### Testing
 
 ```bash
+# Run all tests
 go test ./...
+
+# Run tests with coverage
+go test -race -coverprofile=coverage.out ./...
+
+# Run tests in test mode (useful for integration tests)
+go build ./cmd/brewol
+./brewol --test-mode --max-cycles 3 -g "test goal" -m test-model
 ```
 
-### Release
+### Code Formatting
 
-Releases are automated via GoReleaser on tag push:
+Before committing, ensure all code is properly formatted:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+gofmt -w .
 ```
+
+CI will fail if code is not formatted.
+
+### Release Process
+
+Releases are fully automated via GitHub Actions and GoReleaser:
+
+1. **Create and push a version tag:**
+   ```bash
+   # Tag format: vMAJOR.MINOR.PATCH (e.g., v1.2.3)
+   git tag v0.1.0
+   git push origin v0.1.0
+   ```
+
+2. **Automated steps (no manual intervention):**
+   - Full CI runs (tests, linting, formatting checks, multi-platform builds)
+   - GoReleaser creates GitHub Release with:
+     - Binary archives for all platforms (Linux, macOS, Windows)
+     - Checksums
+     - Changelog
+   - Homebrew tap is automatically updated
+
+3. **Installation after release:**
+   ```bash
+   # Homebrew (recommended)
+   brew tap <owner>/tap
+   brew install brewol
+
+   # Or download binary from GitHub Releases
+   # https://github.com/<owner>/brewol/releases
+   ```
+
+### Release Requirements
+
+- All tests must pass
+- Code must be formatted (gofmt)
+- Linting must pass (golangci-lint)
+- Tag must follow semantic versioning: `vMAJOR.MINOR.PATCH`
+
+### GitHub Secrets Required for Releases
+
+The following secrets must be configured in the GitHub repository:
+- `HOMEBREW_TAP_GITHUB_TOKEN`: Personal access token with write access to the Homebrew tap repository
 
 ## Contributing
 
@@ -268,3 +321,55 @@ MIT License - see [LICENSE](LICENSE) for details.
 - [Bubble Tea](https://github.com/charmbracelet/bubbletea) - TUI framework
 - [Lip Gloss](https://github.com/charmbracelet/lipgloss) - Styling
 - [Ollama](https://ollama.ai) - Local LLM runtime
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi

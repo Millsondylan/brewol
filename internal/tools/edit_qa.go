@@ -12,12 +12,12 @@ import (
 
 // EditQAResult contains the results of post-edit verification
 type EditQAResult struct {
-	ToolResult    *ToolResult // The original tool result
-	Verified      bool        // Whether verification passed
-	ReadBackDiff  string      // Diff between expected and actual (if any)
-	FilesModified []string    // List of files modified
-	GitDiffStat   string      // Output of git diff --stat
-	GitDiffSnippet string     // Bounded git diff snippet
+	ToolResult     *ToolResult // The original tool result
+	Verified       bool        // Whether verification passed
+	ReadBackDiff   string      // Diff between expected and actual (if any)
+	FilesModified  []string    // List of files modified
+	GitDiffStat    string      // Output of git diff --stat
+	GitDiffSnippet string      // Bounded git diff snippet
 }
 
 // ExecuteWithQA executes a tool with post-edit verification for fs_write and fs_patch

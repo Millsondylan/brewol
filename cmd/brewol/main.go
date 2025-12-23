@@ -28,6 +28,8 @@ func main() {
 		goal        string
 		model       string
 		showVersion bool
+		testMode    bool
+		maxCycles   int
 	)
 
 	flag.StringVar(&workspace, "workspace", "", "Workspace root directory (default: current directory)")
@@ -38,6 +40,8 @@ func main() {
 	flag.StringVar(&model, "m", "", "Ollama model to use (shorthand)")
 	flag.BoolVar(&showVersion, "version", false, "Show version information")
 	flag.BoolVar(&showVersion, "v", false, "Show version information (shorthand)")
+	flag.BoolVar(&testMode, "test-mode", false, "Enable test mode (exit after max-cycles)")
+	flag.IntVar(&maxCycles, "max-cycles", 1, "Maximum cycles to run in test mode (default: 1)")
 
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, `brewol - Autonomous Coding Agent
@@ -129,6 +133,8 @@ For more information: https://github.com/ai/brewol
 	eng, err := engine.NewEngine(engine.Config{
 		WorkspaceRoot: workspace,
 		Goal:          goal,
+		TestMode:      testMode,
+		MaxCycles:     maxCycles,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: failed to create engine: %v\n", err)
@@ -146,8 +152,12 @@ For more information: https://github.com/ai/brewol
 			models, err := eng.Client().ListModels(ctx)
 			if err == nil && len(models) > 0 {
 				eng.Client().SetModel(models[0].Name)
+				eng.SyncContextSize() // Update context size for the selected model
 				fmt.Fprintf(os.Stderr, "Auto-selected model: %s\n\n", models[0].Name)
 			}
+		} else {
+			// Model was set from environment or flag - sync context size
+			eng.SyncContextSize()
 		}
 	}
 

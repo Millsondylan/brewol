@@ -13,10 +13,10 @@ import (
 
 // Config holds memory manager configuration
 type Config struct {
-	WorkspaceRoot     string
-	UpdateInterval    int    // Update memory every N cycles (default 5)
-	MaxContextTurns   int    // Max turns to keep in active context (default 10)
-	SummaryModel      string // Model to use for summarization (empty = use main model)
+	WorkspaceRoot   string
+	UpdateInterval  int    // Update memory every N cycles (default 5)
+	MaxContextTurns int    // Max turns to keep in active context (default 10)
+	SummaryModel    string // Model to use for summarization (empty = use main model)
 }
 
 // DefaultConfig returns default configuration
@@ -31,39 +31,39 @@ func DefaultConfig(workspaceRoot string) Config {
 // WorkingMemory represents the compact memory blob fed to the model
 type WorkingMemory struct {
 	// Project info
-	ProjectType     string   `json:"project_type"`
-	BuildCommand    string   `json:"build_command"`
-	TestCommand     string   `json:"test_command"`
-	KeyDirectories  []string `json:"key_directories"`
-	KeyModules      []string `json:"key_modules"`
+	ProjectType    string   `json:"project_type"`
+	BuildCommand   string   `json:"build_command"`
+	TestCommand    string   `json:"test_command"`
+	KeyDirectories []string `json:"key_directories"`
+	KeyModules     []string `json:"key_modules"`
 
 	// Conventions
-	Conventions     []string `json:"conventions"`
-	Constraints     []string `json:"constraints"`
+	Conventions []string `json:"conventions"`
+	Constraints []string `json:"constraints"`
 
 	// Current state
-	CurrentBranch   string   `json:"current_branch"`
-	LastGoodCommit  string   `json:"last_good_commit"`
-	LastGoodCommand string   `json:"last_good_command"`
+	CurrentBranch   string `json:"current_branch"`
+	LastGoodCommit  string `json:"last_good_commit"`
+	LastGoodCommand string `json:"last_good_command"`
 
 	// Backlog summary
-	BacklogSummary  []string `json:"backlog_summary"`
+	BacklogSummary []string `json:"backlog_summary"`
 
 	// Session metadata
-	CycleCount      int       `json:"cycle_count"`
-	LastUpdated     time.Time `json:"last_updated"`
-	UpdateReason    string    `json:"update_reason"`
+	CycleCount   int       `json:"cycle_count"`
+	LastUpdated  time.Time `json:"last_updated"`
+	UpdateReason string    `json:"update_reason"`
 }
 
 // Manager manages rolling memory for agent sessions
 type Manager struct {
-	config           Config
-	memory           WorkingMemory
-	memoryFile       string
-	transcriptFile   *os.File
-	fullLogFile      *os.File
+	config            Config
+	memory            WorkingMemory
+	memoryFile        string
+	transcriptFile    *os.File
+	fullLogFile       *os.File
 	cyclesSinceUpdate int
-	mu               sync.RWMutex
+	mu                sync.RWMutex
 }
 
 // NewManager creates a new memory manager
@@ -456,12 +456,12 @@ RULES:
 // BuildDeterministicSummary builds a fallback summary from tool logs and git state
 func BuildDeterministicSummary(projectType, buildCmd, testCmd, branch string, dirtyFiles []string) WorkingMemory {
 	mem := WorkingMemory{
-		ProjectType:    projectType,
-		BuildCommand:   buildCmd,
-		TestCommand:    testCmd,
-		CurrentBranch:  branch,
-		LastUpdated:    time.Now(),
-		UpdateReason:   "deterministic-fallback",
+		ProjectType:   projectType,
+		BuildCommand:  buildCmd,
+		TestCommand:   testCmd,
+		CurrentBranch: branch,
+		LastUpdated:   time.Now(),
+		UpdateReason:  "deterministic-fallback",
 	}
 
 	// Add dirty files as backlog if any

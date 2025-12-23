@@ -336,14 +336,14 @@ var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)(bearer)\s+([A-Za-z0-9_\-\.]{20,})`),
 
 	// Specific service patterns
-	regexp.MustCompile(`sk-[A-Za-z0-9]{32,}`),                       // OpenAI
-	regexp.MustCompile(`sk-ant-[A-Za-z0-9\-]{32,}`),                 // Anthropic
-	regexp.MustCompile(`ghp_[A-Za-z0-9]{36,}`),                      // GitHub PAT
-	regexp.MustCompile(`gho_[A-Za-z0-9]{36,}`),                      // GitHub OAuth
-	regexp.MustCompile(`github_pat_[A-Za-z0-9_]{22,}`),              // GitHub fine-grained PAT
-	regexp.MustCompile(`xoxb-[A-Za-z0-9\-]+`),                       // Slack bot token
-	regexp.MustCompile(`xoxp-[A-Za-z0-9\-]+`),                       // Slack user token
-	regexp.MustCompile(`AKIA[A-Z0-9]{16}`),                          // AWS Access Key
+	regexp.MustCompile(`sk-[A-Za-z0-9]{32,}`),          // OpenAI
+	regexp.MustCompile(`sk-ant-[A-Za-z0-9\-]{32,}`),    // Anthropic
+	regexp.MustCompile(`ghp_[A-Za-z0-9]{36,}`),         // GitHub PAT
+	regexp.MustCompile(`gho_[A-Za-z0-9]{36,}`),         // GitHub OAuth
+	regexp.MustCompile(`github_pat_[A-Za-z0-9_]{22,}`), // GitHub fine-grained PAT
+	regexp.MustCompile(`xoxb-[A-Za-z0-9\-]+`),          // Slack bot token
+	regexp.MustCompile(`xoxp-[A-Za-z0-9\-]+`),          // Slack user token
+	regexp.MustCompile(`AKIA[A-Z0-9]{16}`),             // AWS Access Key
 	regexp.MustCompile(`(?i)aws[_-]?secret[_-]?access[_-]?key[=:]\s*["']?([A-Za-z0-9/+=]{40})["']?`),
 
 	// Generic long secrets

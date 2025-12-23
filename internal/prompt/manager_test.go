@@ -294,81 +294,81 @@ func TestManager_GetEffectivePromptRedacted(t *testing.T) {
 
 func TestRedactSecrets(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		contains string // should not contain after redaction
+		name      string
+		input     string
+		contains  string // should not contain after redaction
 		hasRedact bool
 	}{
 		{
-			name:     "OpenAI API key",
-			input:    "sk-abc123def456ghi789jkl012mno345pq",
-			contains: "sk-abc",
+			name:      "OpenAI API key",
+			input:     "sk-abc123def456ghi789jkl012mno345pq",
+			contains:  "sk-abc",
 			hasRedact: true,
 		},
 		{
-			name:     "Anthropic API key",
-			input:    "sk-ant-abc123def456ghi789jkl012mno345pq",
-			contains: "sk-ant-",
+			name:      "Anthropic API key",
+			input:     "sk-ant-abc123def456ghi789jkl012mno345pq",
+			contains:  "sk-ant-",
 			hasRedact: true,
 		},
 		{
-			name:     "GitHub PAT",
-			input:    "ghp_abcdefghijklmnopqrstuvwxyz123456789012",
-			contains: "ghp_",
+			name:      "GitHub PAT",
+			input:     "ghp_abcdefghijklmnopqrstuvwxyz123456789012",
+			contains:  "ghp_",
 			hasRedact: true,
 		},
 		{
-			name:     "GitHub OAuth",
-			input:    "gho_abcdefghijklmnopqrstuvwxyz123456789012",
-			contains: "gho_",
+			name:      "GitHub OAuth",
+			input:     "gho_abcdefghijklmnopqrstuvwxyz123456789012",
+			contains:  "gho_",
 			hasRedact: true,
 		},
 		{
-			name:     "GitHub fine-grained PAT",
-			input:    "github_pat_abcdefghijklmnopqrstuvwxyz",
-			contains: "github_pat_",
+			name:      "GitHub fine-grained PAT",
+			input:     "github_pat_abcdefghijklmnopqrstuvwxyz",
+			contains:  "github_pat_",
 			hasRedact: true,
 		},
 		{
-			name:     "Slack bot token",
-			input:    "xoxb-123-456-abcdefghijklmnop",
-			contains: "xoxb-",
+			name:      "Slack bot token",
+			input:     "xoxb-123-456-abcdefghijklmnop",
+			contains:  "xoxb-",
 			hasRedact: true,
 		},
 		{
-			name:     "Slack user token",
-			input:    "xoxp-123-456-abcdefghijklmnop",
-			contains: "xoxp-",
+			name:      "Slack user token",
+			input:     "xoxp-123-456-abcdefghijklmnop",
+			contains:  "xoxp-",
 			hasRedact: true,
 		},
 		{
-			name:     "AWS Access Key",
-			input:    "AKIAIOSFODNN7EXAMPLE",
-			contains: "AKIA",
+			name:      "AWS Access Key",
+			input:     "AKIAIOSFODNN7EXAMPLE",
+			contains:  "AKIA",
 			hasRedact: true,
 		},
 		{
-			name:     "API key assignment",
-			input:    "api_key: abc123def456ghi789jkl012",
-			contains: "abc123def456ghi789jkl012",
+			name:      "API key assignment",
+			input:     "api_key: abc123def456ghi789jkl012",
+			contains:  "abc123def456ghi789jkl012",
 			hasRedact: true,
 		},
 		{
-			name:     "Bearer token",
-			input:    "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
-			contains: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+			name:      "Bearer token",
+			input:     "Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
+			contains:  "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9",
 			hasRedact: true,
 		},
 		{
-			name:     "Password",
-			input:    "password: mysecretpassword123",
-			contains: "mysecretpassword123",
+			name:      "Password",
+			input:     "password: mysecretpassword123",
+			contains:  "mysecretpassword123",
 			hasRedact: true,
 		},
 		{
-			name:     "No secrets",
-			input:    "This is normal text without secrets",
-			contains: "",
+			name:      "No secrets",
+			input:     "This is normal text without secrets",
+			contains:  "",
 			hasRedact: false,
 		},
 	}

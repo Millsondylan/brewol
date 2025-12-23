@@ -15,6 +15,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
+	ctxmgr "github.com/ai/brewol/internal/context"
 	"github.com/ai/brewol/internal/engine"
 	"github.com/ai/brewol/internal/ollama"
 	"github.com/ai/brewol/internal/tools"
@@ -22,16 +23,17 @@ import (
 
 // KeyMap defines the keybindings
 type KeyMap struct {
-	Escape       key.Binding
-	CommandMode  key.Binding
-	ModelPicker  key.Binding
-	ToggleDiff   key.Binding
-	OpenLogs     key.Binding
-	Help         key.Binding
-	ScrollUp     key.Binding
-	ScrollDown   key.Binding
-	PageUp       key.Binding
-	PageDown     key.Binding
+	Escape         key.Binding
+	CommandMode    key.Binding
+	ModelPicker    key.Binding
+	ToggleDiff     key.Binding
+	ToggleThinking key.Binding
+	OpenLogs       key.Binding
+	Help           key.Binding
+	ScrollUp       key.Binding
+	ScrollDown     key.Binding
+	PageUp         key.Binding
+	PageDown       key.Binding
 }
 
 // DefaultKeyMap returns the default keybindings
@@ -52,6 +54,10 @@ func DefaultKeyMap() KeyMap {
 		ToggleDiff: key.NewBinding(
 			key.WithKeys("ctrl+d"),
 			key.WithHelp("ctrl+d", "toggle diff"),
+		),
+		ToggleThinking: key.NewBinding(
+			key.WithKeys("ctrl+t"),
+			key.WithHelp("ctrl+t", "toggle thinking"),
 		),
 		OpenLogs: key.NewBinding(
 			key.WithKeys("ctrl+l"),
@@ -89,42 +95,49 @@ func (k KeyMap) ShortHelp() []key.Binding {
 func (k KeyMap) FullHelp() [][]key.Binding {
 	return [][]key.Binding{
 		{k.Escape, k.CommandMode, k.ModelPicker},
-		{k.ToggleDiff, k.OpenLogs, k.Help},
+		{k.ToggleDiff, k.ToggleThinking, k.OpenLogs, k.Help},
 		{k.ScrollUp, k.ScrollDown, k.PageUp, k.PageDown},
 	}
 }
 
 // Model is the main TUI model
 type Model struct {
-	engine        *engine.Engine
-	keyMap        KeyMap
-	help          help.Model
-	spinner       spinner.Model
-	streamView    viewport.Model
-	toolLogView   viewport.Model
-	backlogView   viewport.Model
-	commandInput  textinput.Model
-	promptInput   textinput.Model
-	width         int
-	height        int
-	streamContent string
-	toolLogs      []ToolLogEntry
-	suggestions   []engine.Suggestion
-	showHelp      bool
-	showDiff      bool
-	showCommand   bool
-	showModels    bool
-	inputFocused  bool
-	showCmdList   bool
-	filteredCmds  []Command
-	selectedCmd   int
-	models        []ollama.ModelInfo
-	selectedModel int
-	tokensPerSec  float64
-	lastExitCode  int
-	lastEscTime   time.Time
-	quitting      bool
-	err           error
+	engine          *engine.Engine
+	keyMap          KeyMap
+	help            help.Model
+	spinner         spinner.Model
+	streamView      viewport.Model
+	toolLogView     viewport.Model
+	backlogView     viewport.Model
+	thinkingView    viewport.Model
+	commandInput    textinput.Model
+	promptInput     textinput.Model
+	width           int
+	height          int
+	streamContent   string
+	thinkingContent string
+	thinkingBuffer  []string // Rolling buffer for display (capped)
+	fullThinking    string   // Full thinking content for logging
+	isThinking      bool     // Currently in thinking phase
+	toolLogs        []ToolLogEntry
+	suggestions     []engine.Suggestion
+	showHelp        bool
+	showDiff        bool
+	showCommand     bool
+	showModels      bool
+	showThinking    bool // Show/hide thinking pane (Ctrl+T toggle)
+	hideThinkingUI  bool // /hidethinking setting - UI-only toggle
+	inputFocused    bool
+	showCmdList     bool
+	filteredCmds    []Command
+	selectedCmd     int
+	models          []ollama.ModelInfo
+	selectedModel   int
+	tokensPerSec    float64
+	lastExitCode    int
+	lastEscTime     time.Time
+	quitting        bool
+	err             error
 }
 
 // ToolLogEntry represents a tool execution log entry
@@ -164,6 +177,12 @@ func AvailableCommands() []Command {
 		// Memory commands
 		{Name: "/summary", Description: "Show operational summary", NeedsArg: false},
 		{Name: "/memory", Description: "Show/reset rolling memory", NeedsArg: false},
+		// Context commands
+		{Name: "/context", Description: "Context: show|set <num>|compact", NeedsArg: false},
+		{Name: "/tasks", Description: "Show task list or compact", NeedsArg: false},
+		// Thinking commands
+		{Name: "/think", Description: "Think: show|on|off|auto|low|medium|high", NeedsArg: false},
+		{Name: "/hidethinking", Description: "Hide thinking panel: on|off", NeedsArg: false},
 	}
 }
 
@@ -182,14 +201,20 @@ func New(eng *engine.Engine) Model {
 	pi.CharLimit = 1024
 	pi.Focus()
 
+	// Check if thinking should be visible by default
+	thinkMode := eng.Client().GetThinkMode()
+	showThinking := thinkMode != ollama.ThinkModeOff
+
 	return Model{
-		engine:       eng,
-		keyMap:       DefaultKeyMap(),
-		help:         help.New(),
-		spinner:      s,
-		commandInput: ti,
-		promptInput:  pi,
-		inputFocused: true,
+		engine:         eng,
+		keyMap:         DefaultKeyMap(),
+		help:           help.New(),
+		spinner:        s,
+		commandInput:   ti,
+		promptInput:    pi,
+		inputFocused:   true,
+		showThinking:   showThinking,
+		thinkingBuffer: make([]string, 0, 100), // Cap at 100 lines for display
 	}
 }
 
@@ -356,7 +381,9 @@ func (m Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if m.selectedModel < len(m.models) {
 				selectedName := m.models[m.selectedModel].Name
 				m.engine.Client().SetModel(selectedName)
-				m.streamContent += fmt.Sprintf("[Model changed to: %s]\n", selectedName)
+				m.engine.SyncContextSize() // Update context size for new model
+				ctxSize := m.engine.GetNumCtx()
+				m.streamContent += fmt.Sprintf("[Model changed to: %s (context: %dk)]\n", selectedName, ctxSize/1024)
 				m.streamView.SetContent(m.streamContent)
 			}
 			m.showModels = false
@@ -497,6 +524,18 @@ func (m Model) handleKeyMsg(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case key.Matches(msg, m.keyMap.ToggleDiff):
 		m.showDiff = !m.showDiff
 		m.updateViewports()
+		return m, nil
+
+	case key.Matches(msg, m.keyMap.ToggleThinking):
+		m.showThinking = !m.showThinking
+		m.updateViewports()
+		status := "hidden"
+		if m.showThinking {
+			status = "visible"
+		}
+		m.streamContent += fmt.Sprintf("\n[Thinking panel %s]\n", status)
+		m.streamView.SetContent(m.streamContent)
+		m.streamView.GotoBottom()
 		return m, nil
 
 	case key.Matches(msg, m.keyMap.OpenLogs):
@@ -647,6 +686,18 @@ func (m Model) executeCommand(cmd string) (tea.Model, tea.Cmd) {
 	case "/memory":
 		return m.handleMemoryCommand(parts)
 
+	case "/context":
+		return m.handleContextCommand(parts)
+
+	case "/tasks":
+		return m.handleTasksCommand(parts)
+
+	case "/think":
+		return m.handleThinkCommand(parts)
+
+	case "/hidethinking":
+		return m.handleHideThinkingCommand(parts)
+
 	default:
 		m.streamContent += fmt.Sprintf("\n[Unknown command: %s]\n", parts[0])
 	}
@@ -663,7 +714,34 @@ func (m Model) handleEngineUpdate(update engine.CycleUpdate) Model {
 		m.streamContent += fmt.Sprintf("[%s] %s\n", update.State, update.Message)
 	}
 
-	// Handle streaming tokens
+	// Handle thinking content (displayed in thinking pane, NOT added to conversation)
+	if update.ThinkingContent != "" {
+		m.isThinking = update.IsThinking
+		m.fullThinking += update.ThinkingContent
+		m.thinkingContent += update.ThinkingContent
+
+		// Keep display buffer capped at ~100 lines
+		lines := strings.Split(m.thinkingContent, "\n")
+		if len(lines) > 100 {
+			m.thinkingContent = strings.Join(lines[len(lines)-100:], "\n")
+		}
+
+		// Update thinking view if visible
+		if m.showThinking && !m.hideThinkingUI {
+			m.thinkingView.SetContent(m.thinkingContent)
+			m.thinkingView.GotoBottom()
+		}
+	}
+
+	// Track when we transition out of thinking phase
+	if !update.IsThinking && m.isThinking {
+		m.isThinking = false
+		// Clear thinking buffer for next response (full log preserved on disk)
+		m.thinkingContent = ""
+		m.fullThinking = ""
+	}
+
+	// Handle streaming tokens (answer content)
 	if update.TokenContent != "" {
 		m.streamContent += update.TokenContent
 		m.tokensPerSec = update.TokensPerSec
@@ -719,13 +797,25 @@ func (m *Model) updateViewports() {
 		mainWidth = m.width - sideWidth - 1
 	}
 
+	// Calculate heights - reserve space for thinking pane if visible
+	thinkingHeight := 0
+	if m.showThinking && !m.hideThinkingUI && m.width > 80 {
+		thinkingHeight = 10 // Fixed height for thinking pane
+	}
+
 	// Stream view (main content)
-	m.streamView = viewport.New(mainWidth, contentHeight-10)
+	m.streamView = viewport.New(mainWidth, contentHeight-10-thinkingHeight)
 	m.streamView.SetContent(m.streamContent)
 
 	// Tool log view
 	m.toolLogView = viewport.New(mainWidth, 8)
 	m.updateToolLogView()
+
+	// Thinking view (if visible)
+	if thinkingHeight > 0 {
+		m.thinkingView = viewport.New(mainWidth, thinkingHeight-2) // -2 for border
+		m.thinkingView.SetContent(m.thinkingContent)
+	}
 
 	// Backlog view (if showing diff/side panel)
 	if sideWidth > 0 {
@@ -836,10 +926,22 @@ func (m Model) renderHeader() string {
 	branchStr := headerStyle.Render(fmt.Sprintf("Branch: %s", branch))
 	projectStr := headerStyle.Render(fmt.Sprintf("Project: %s", project.Type))
 
+	// Build think mode indicator
+	thinkMode := m.engine.Client().GetThinkMode()
+	thinkStyle := lipgloss.NewStyle().
+		Background(lipgloss.Color("99")).
+		Foreground(lipgloss.Color("230")).
+		Padding(0, 1)
+	thinkStr := thinkStyle.Render(fmt.Sprintf("Think: %s", thinkMode))
+
+	// Build context meter
+	ctxState := m.engine.GetContextState()
+	ctxMeter := m.renderContextMeter(ctxState)
+
 	stats := statsStyle.Render(fmt.Sprintf("%.1f tok/s | exit: %d", m.tokensPerSec, m.lastExitCode))
 
 	left := lipgloss.JoinHorizontal(lipgloss.Left, mode, " ", stateStr, " ", m.spinner.View())
-	right := lipgloss.JoinHorizontal(lipgloss.Right, modelStr, " ", branchStr, " ", projectStr, " ", stats)
+	right := lipgloss.JoinHorizontal(lipgloss.Right, thinkStr, " ", ctxMeter, " ", modelStr, " ", branchStr, " ", projectStr, " ", stats)
 
 	// Calculate spacing
 	leftWidth := lipgloss.Width(left)
@@ -850,6 +952,42 @@ func (m Model) renderHeader() string {
 	}
 
 	return lipgloss.JoinHorizontal(lipgloss.Left, left, strings.Repeat(" ", spacing), right)
+}
+
+// renderContextMeter renders the context usage meter
+func (m Model) renderContextMeter(state ctxmgr.BudgetState) string {
+	if state.NumCtx == 0 {
+		return ""
+	}
+
+	// Calculate percentage
+	pct := int(state.UsageRatio * 100)
+	if pct > 100 {
+		pct = 100
+	}
+
+	// Choose color based on usage
+	var color lipgloss.Color
+	switch {
+	case state.UsageRatio >= 0.80:
+		color = lipgloss.Color("196") // Red
+	case state.UsageRatio >= 0.60:
+		color = lipgloss.Color("214") // Orange
+	default:
+		color = lipgloss.Color("82") // Green
+	}
+
+	meterStyle := lipgloss.NewStyle().
+		Background(lipgloss.Color("236")).
+		Foreground(color).
+		Padding(0, 1)
+
+	// Format: "CTX: 4.2k/8k (52%)"
+	promptK := float64(state.LastPromptTokens) / 1000
+	ctxK := float64(state.NumCtx) / 1000
+
+	meterText := fmt.Sprintf("CTX:%.1fk/%.0fk(%d%%)", promptK, ctxK, pct)
+	return meterStyle.Render(meterText)
 }
 
 func (m Model) renderMainContent() string {
@@ -881,6 +1019,31 @@ func (m Model) renderMainContent() string {
 		}
 
 		b.WriteString(sugStyle.Render(sugContent.String()))
+		b.WriteString("\n")
+	}
+
+	// Thinking pane (if visible and not hidden)
+	if m.showThinking && !m.hideThinkingUI {
+		thinkingStyle := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("99")).
+			Padding(0, 1).
+			Width(m.width - 4)
+
+		thinkingHeader := "THINKING"
+		if m.isThinking {
+			thinkingHeader = "THINKING..."
+		}
+
+		var thinkingPanel strings.Builder
+		thinkingPanel.WriteString(thinkingHeader + "\n")
+		if m.thinkingContent != "" {
+			thinkingPanel.WriteString(m.thinkingView.View())
+		} else {
+			thinkingPanel.WriteString("  [Waiting for model thinking trace...]")
+		}
+
+		b.WriteString(thinkingStyle.Render(thinkingPanel.String()))
 		b.WriteString("\n")
 	}
 
@@ -1231,6 +1394,238 @@ func (m Model) handleMemoryCommand(parts []string) (tea.Model, tea.Cmd) {
 
 	m.streamContent += "\n  Use /memory reset to clear (logs preserved on disk)\n"
 	m.streamContent += "═══════════════════════════════════════════════════════════════\n"
+
+	m.streamView.SetContent(m.streamContent)
+	m.streamView.GotoBottom()
+	return m, nil
+}
+
+// handleContextCommand handles /context command
+func (m Model) handleContextCommand(parts []string) (tea.Model, tea.Cmd) {
+	subCmd := "show"
+	if len(parts) >= 2 {
+		subCmd = parts[1]
+	}
+
+	switch subCmd {
+	case "show":
+		state := m.engine.GetContextState()
+		m.streamContent += "\n╔══════════════════════════════════════════════════════════════╗\n"
+		m.streamContent += "║                   CONTEXT BUDGET                             ║\n"
+		m.streamContent += "╚══════════════════════════════════════════════════════════════╝\n\n"
+
+		m.streamContent += fmt.Sprintf("  Context Window:     %d tokens\n", state.NumCtx)
+		m.streamContent += fmt.Sprintf("  High Watermark:     %d tokens (%.0f%%)\n", state.HighWatermark, 80.0)
+		m.streamContent += fmt.Sprintf("  Low Watermark:      %d tokens (%.0f%%)\n", state.LowWatermark, 60.0)
+		m.streamContent += fmt.Sprintf("\n  Last Prompt Tokens: %d\n", state.LastPromptTokens)
+		m.streamContent += fmt.Sprintf("  Last Eval Tokens:   %d\n", state.LastEvalTokens)
+		m.streamContent += fmt.Sprintf("  Usage:              %.1f%%\n", state.UsageRatio*100)
+		m.streamContent += fmt.Sprintf("  Available:          %d tokens\n", state.AvailableTokens)
+
+		if state.NeedsCompaction {
+			m.streamContent += "\n  ⚠️  COMPACTION NEEDED\n"
+		}
+
+		// Show last compaction event
+		if event := m.engine.BudgetManager().GetLastCompactionEvent(); event != nil {
+			m.streamContent += fmt.Sprintf("\n  Last Compaction: %s\n", event.CompactedItems)
+			m.streamContent += fmt.Sprintf("  Tokens: %d → %d\n", event.TokensBefore, event.TokensAfter)
+		}
+
+		m.streamContent += "\n═══════════════════════════════════════════════════════════════\n"
+
+	case "set":
+		if len(parts) < 3 {
+			m.streamContent += "\n[Usage: /context set <num_ctx>]\n"
+		} else {
+			var numCtx int
+			fmt.Sscanf(parts[2], "%d", &numCtx)
+			if numCtx < 1024 {
+				m.streamContent += "\n[Error: num_ctx must be at least 1024]\n"
+			} else {
+				m.engine.SetNumCtx(numCtx)
+				m.streamContent += fmt.Sprintf("\n[Context window set to: %d tokens]\n", numCtx)
+			}
+		}
+
+	case "compact":
+		m.engine.ForceCompact()
+		m.streamContent += "\n[Forcing context compaction...]\n"
+
+	default:
+		m.streamContent += "\n[Usage: /context show|set <num>|compact]\n"
+	}
+
+	m.streamView.SetContent(m.streamContent)
+	m.streamView.GotoBottom()
+	return m, nil
+}
+
+// handleTasksCommand handles /tasks command
+func (m Model) handleTasksCommand(parts []string) (tea.Model, tea.Cmd) {
+	subCmd := "show"
+	if len(parts) >= 2 {
+		subCmd = parts[1]
+	}
+
+	switch subCmd {
+	case "show":
+		tasks := m.engine.TaskStore().GetAllTasks()
+		m.streamContent += "\n╔══════════════════════════════════════════════════════════════╗\n"
+		m.streamContent += "║                   TASK LIST                                  ║\n"
+		m.streamContent += "╚══════════════════════════════════════════════════════════════╝\n\n"
+
+		if len(tasks) == 0 {
+			m.streamContent += "  [No tasks in store]\n"
+		} else {
+			// Show current task
+			current := m.engine.TaskStore().GetCurrentTask()
+			if current != nil {
+				m.streamContent += fmt.Sprintf("  ► CURRENT: [P%d] %s\n", current.Priority, truncate(current.Title, 50))
+				if current.NextAction != "" {
+					m.streamContent += fmt.Sprintf("    Next: %s\n", truncate(current.NextAction, 45))
+				}
+				m.streamContent += "\n"
+			}
+
+			// Show pending tasks
+			pending := m.engine.TaskStore().GetPendingTasks()
+			if len(pending) > 0 {
+				m.streamContent += "  PENDING:\n"
+				for i, task := range pending {
+					if i >= 10 {
+						m.streamContent += fmt.Sprintf("    ... and %d more\n", len(pending)-10)
+						break
+					}
+					m.streamContent += fmt.Sprintf("    %d. [P%d/%s] %s\n", i+1, task.Priority, task.Category, truncate(task.Title, 45))
+				}
+				m.streamContent += "\n"
+			}
+
+			// Show counts
+			catCounts := m.engine.TaskStore().GetCategoryCounts()
+			if len(catCounts) > 0 {
+				m.streamContent += "  BY CATEGORY:\n"
+				for cat, count := range catCounts {
+					m.streamContent += fmt.Sprintf("    %s: %d\n", cat, count)
+				}
+			}
+		}
+
+		m.streamContent += "\n═══════════════════════════════════════════════════════════════\n"
+
+	case "compact":
+		brief := m.engine.GetTaskBrief(ctxmgr.TaskBriefCompact)
+		m.streamContent += "\n[Task Brief (Compact Mode)]\n"
+		m.streamContent += brief.FormatCompact()
+		m.streamContent += "\n"
+
+	case "clear":
+		m.engine.TaskStore().ClearCompleted()
+		m.streamContent += "\n[Completed tasks cleared]\n"
+
+	default:
+		m.streamContent += "\n[Usage: /tasks show|compact|clear]\n"
+	}
+
+	m.streamView.SetContent(m.streamContent)
+	m.streamView.GotoBottom()
+	return m, nil
+}
+
+// handleThinkCommand handles /think command
+func (m Model) handleThinkCommand(parts []string) (tea.Model, tea.Cmd) {
+	subCmd := "show"
+	if len(parts) >= 2 {
+		subCmd = parts[1]
+	}
+
+	switch subCmd {
+	case "show":
+		mode := m.engine.Client().GetThinkMode()
+		isCapable := m.engine.Client().IsThinkingCapable()
+		panelVisible := m.showThinking && !m.hideThinkingUI
+
+		m.streamContent += "\n╔══════════════════════════════════════════════════════════════╗\n"
+		m.streamContent += "║                   THINKING STATUS                            ║\n"
+		m.streamContent += "╚══════════════════════════════════════════════════════════════╝\n\n"
+
+		m.streamContent += fmt.Sprintf("  Think Mode:     %s\n", mode)
+		m.streamContent += fmt.Sprintf("  Model Capable:  %v\n", isCapable)
+		m.streamContent += fmt.Sprintf("  Panel Visible:  %v\n", panelVisible)
+		m.streamContent += fmt.Sprintf("  Hide UI:        %v\n", m.hideThinkingUI)
+
+		if m.isThinking {
+			m.streamContent += "\n  Currently thinking...\n"
+		}
+
+		m.streamContent += "\n  Use: /think on|off|auto|low|medium|high\n"
+		m.streamContent += "  Use: /hidethinking on|off (UI-only toggle)\n"
+		m.streamContent += "  Use: Ctrl+T to toggle thinking panel\n"
+		m.streamContent += "\n═══════════════════════════════════════════════════════════════\n"
+
+	case "on":
+		m.engine.Client().SetThinkMode(ollama.ThinkModeOn)
+		m.showThinking = true
+		m.streamContent += "\n[Thinking mode: ON - model will include reasoning trace]\n"
+
+	case "off":
+		m.engine.Client().SetThinkMode(ollama.ThinkModeOff)
+		m.showThinking = false
+		m.streamContent += "\n[Thinking mode: OFF - no reasoning trace]\n"
+
+	case "auto":
+		m.engine.Client().SetThinkMode(ollama.ThinkModeAuto)
+		m.showThinking = m.engine.Client().IsThinkingCapable()
+		m.streamContent += "\n[Thinking mode: AUTO - enabled for thinking-capable models]\n"
+
+	case "low":
+		m.engine.Client().SetThinkMode(ollama.ThinkModeLow)
+		m.showThinking = true
+		m.streamContent += "\n[Thinking mode: LOW - minimal reasoning trace]\n"
+
+	case "medium":
+		m.engine.Client().SetThinkMode(ollama.ThinkModeMedium)
+		m.showThinking = true
+		m.streamContent += "\n[Thinking mode: MEDIUM - balanced reasoning trace]\n"
+
+	case "high":
+		m.engine.Client().SetThinkMode(ollama.ThinkModeHigh)
+		m.showThinking = true
+		m.streamContent += "\n[Thinking mode: HIGH - extensive reasoning trace]\n"
+
+	default:
+		m.streamContent += "\n[Usage: /think show|on|off|auto|low|medium|high]\n"
+	}
+
+	m.streamView.SetContent(m.streamContent)
+	m.streamView.GotoBottom()
+	return m, nil
+}
+
+// handleHideThinkingCommand handles /hidethinking command
+func (m Model) handleHideThinkingCommand(parts []string) (tea.Model, tea.Cmd) {
+	subCmd := "show"
+	if len(parts) >= 2 {
+		subCmd = parts[1]
+	}
+
+	switch subCmd {
+	case "on":
+		m.hideThinkingUI = true
+		m.streamContent += "\n[Thinking panel hidden (still requesting thinking from model)]\n"
+
+	case "off":
+		m.hideThinkingUI = false
+		m.streamContent += "\n[Thinking panel visible]\n"
+
+	default:
+		status := "visible"
+		if m.hideThinkingUI {
+			status = "hidden"
+		}
+		m.streamContent += fmt.Sprintf("\n[Thinking panel: %s. Use: /hidethinking on|off]\n", status)
+	}
 
 	m.streamView.SetContent(m.streamContent)
 	m.streamView.GotoBottom()

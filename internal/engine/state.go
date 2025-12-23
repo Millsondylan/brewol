@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	ctxmgr "github.com/ai/brewol/internal/context"
 	"github.com/ai/brewol/internal/logs"
 	"github.com/ai/brewol/internal/memory"
 	"github.com/ai/brewol/internal/ollama"
@@ -70,14 +71,16 @@ type Suggestion struct {
 
 // CycleUpdate represents an update during a cycle
 type CycleUpdate struct {
-	State        State
-	Message      string
-	TokenContent string
-	TokensPerSec float64
-	ToolResult   *tools.ToolResult
-	Suggestions  []Suggestion
-	Objective    string
-	Error        error
+	State           State
+	Message         string
+	TokenContent    string
+	ThinkingContent string // Thinking trace tokens
+	IsThinking      bool   // True if currently in thinking phase
+	TokensPerSec    float64
+	ToolResult      *tools.ToolResult
+	Suggestions     []Suggestion
+	Objective       string
+	Error           error
 }
 
 // Engine is the autonomous agent engine
@@ -89,6 +92,10 @@ type Engine struct {
 	session       *logs.Session
 	promptMgr     *prompt.Manager
 	memoryMgr     *memory.Manager
+	budgetMgr     *ctxmgr.BudgetManager
+	taskStore     *ctxmgr.TaskStore
+	taskBriefGen  *ctxmgr.TaskBriefGenerator
+	compactor     *ctxmgr.Compactor
 	messages      []ollama.Message
 	backlog       []BacklogItem
 	objective     string
@@ -105,12 +112,16 @@ type Engine struct {
 	lastError     string // last error message
 	lastVerifyOK  bool   // last verification result
 	pendingCommit bool   // whether there are changes pending commit
+	testMode      bool   // test mode flag
+	maxCycles     int    // max cycles in test mode
 }
 
 // Config holds engine configuration
 type Config struct {
 	WorkspaceRoot string
 	Goal          string
+	TestMode      bool // Enable test mode (exit after MaxCycles)
+	MaxCycles     int  // Maximum cycles in test mode
 }
 
 // NewEngine creates a new autonomous engine
@@ -143,19 +154,53 @@ func NewEngine(cfg Config) (*Engine, error) {
 	// Initialize memory with project info
 	memoryMgr.SetProjectInfo(string(project.Type), project.BuildCommand, project.TestCommand)
 
+	// Create context budget manager
+	// Initialize with model's context size if available
+	budgetCfg := ctxmgr.DefaultBudgetConfig()
+	if model := client.GetModel(); model != "" {
+		budgetCfg.NumCtx = client.GetModelContextSize()
+	}
+	budgetMgr := ctxmgr.NewBudgetManager(budgetCfg)
+
+	// Create task store
+	taskStore, err := ctxmgr.NewTaskStore(cfg.WorkspaceRoot)
+	if err != nil {
+		session.Close()
+		memoryMgr.Close()
+		return nil, fmt.Errorf("failed to create task store: %w", err)
+	}
+
+	// Create task brief generator
+	taskBriefGen := ctxmgr.NewTaskBriefGenerator(taskStore)
+
+	// Create compactor
+	compactorCfg := ctxmgr.DefaultCompactorConfig(cfg.WorkspaceRoot)
+	compactor, err := ctxmgr.NewCompactor(compactorCfg, budgetMgr)
+	if err != nil {
+		session.Close()
+		memoryMgr.Close()
+		return nil, fmt.Errorf("failed to create compactor: %w", err)
+	}
+
 	e := &Engine{
-		client:    client,
-		tools:     toolRegistry,
-		project:   project,
-		verifier:  verifier,
-		session:   session,
-		promptMgr: promptMgr,
-		memoryMgr: memoryMgr,
-		messages:  make([]ollama.Message, 0),
-		backlog:   make([]BacklogItem, 0),
-		state:     StateObserving,
-		updates:   make(chan CycleUpdate, 100),
-		goal:      cfg.Goal,
+		client:       client,
+		tools:        toolRegistry,
+		project:      project,
+		verifier:     verifier,
+		session:      session,
+		promptMgr:    promptMgr,
+		memoryMgr:    memoryMgr,
+		budgetMgr:    budgetMgr,
+		taskStore:    taskStore,
+		taskBriefGen: taskBriefGen,
+		compactor:    compactor,
+		messages:     make([]ollama.Message, 0),
+		backlog:      make([]BacklogItem, 0),
+		state:        StateObserving,
+		updates:      make(chan CycleUpdate, 100),
+		goal:         cfg.Goal,
+		testMode:     cfg.TestMode,
+		maxCycles:    cfg.MaxCycles,
 	}
 
 	return e, nil
@@ -358,34 +403,52 @@ func (e *Engine) GetSummary() Summary {
 	branch := tools.GetCurrentBranch(e.project.Root)
 	dirtyFiles := tools.GetDirtyFiles(e.project.Root)
 
+	// Get context metrics
+	budgetState := e.budgetMgr.GetState()
+	lastCompaction := ""
+	if event := e.budgetMgr.GetLastCompactionEvent(); event != nil {
+		lastCompaction = event.CompactedItems
+	}
+
 	return Summary{
-		CurrentObjective:    e.objective,
-		CurrentState:        e.state.String(),
-		CurrentGoal:         e.goal,
-		CycleCount:          e.cycleCount,
-		LastVerificationOK:  e.lastVerifyOK,
-		CurrentBranch:       branch,
-		DirtyFiles:          dirtyFiles,
-		BacklogItems:        backlogItems,
-		IsPaused:            e.paused,
-		ErrorCount:          e.errorCount,
-		LastError:           e.lastError,
+		CurrentObjective:   e.objective,
+		CurrentState:       e.state.String(),
+		CurrentGoal:        e.goal,
+		CycleCount:         e.cycleCount,
+		LastVerificationOK: e.lastVerifyOK,
+		CurrentBranch:      branch,
+		DirtyFiles:         dirtyFiles,
+		BacklogItems:       backlogItems,
+		IsPaused:           e.paused,
+		ErrorCount:         e.errorCount,
+		LastError:          e.lastError,
+		NumCtx:             budgetState.NumCtx,
+		PromptTokens:       budgetState.LastPromptTokens,
+		EvalTokens:         budgetState.LastEvalTokens,
+		ContextUsageRatio:  budgetState.UsageRatio,
+		LastCompaction:     lastCompaction,
 	}
 }
 
 // Summary represents an operational summary
 type Summary struct {
-	CurrentObjective    string
-	CurrentState        string
-	CurrentGoal         string
-	CycleCount          int
-	LastVerificationOK  bool
-	CurrentBranch       string
-	DirtyFiles          []string
-	BacklogItems        []string
-	IsPaused            bool
-	ErrorCount          int
-	LastError           string
+	CurrentObjective   string
+	CurrentState       string
+	CurrentGoal        string
+	CycleCount         int
+	LastVerificationOK bool
+	CurrentBranch      string
+	DirtyFiles         []string
+	BacklogItems       []string
+	IsPaused           bool
+	ErrorCount         int
+	LastError          string
+	// Context metrics
+	NumCtx            int
+	PromptTokens      int
+	EvalTokens        int
+	ContextUsageRatio float64
+	LastCompaction    string
 }
 
 // ResetMemory resets the working memory
@@ -397,6 +460,120 @@ func (e *Engine) ResetMemory() {
 // GetWorkingMemory returns the current working memory text
 func (e *Engine) GetWorkingMemory() string {
 	return e.memoryMgr.GetWorkingMemoryText()
+}
+
+// BudgetManager returns the context budget manager
+func (e *Engine) BudgetManager() *ctxmgr.BudgetManager {
+	return e.budgetMgr
+}
+
+// TaskStore returns the task store
+func (e *Engine) TaskStore() *ctxmgr.TaskStore {
+	return e.taskStore
+}
+
+// TaskBriefGenerator returns the task brief generator
+func (e *Engine) TaskBriefGenerator() *ctxmgr.TaskBriefGenerator {
+	return e.taskBriefGen
+}
+
+// Compactor returns the compactor
+func (e *Engine) Compactor() *ctxmgr.Compactor {
+	return e.compactor
+}
+
+// GetContextState returns the current context budget state
+func (e *Engine) GetContextState() ctxmgr.BudgetState {
+	return e.budgetMgr.GetState()
+}
+
+// SetNumCtx sets the context window size
+func (e *Engine) SetNumCtx(numCtx int) {
+	e.budgetMgr.SetNumCtx(numCtx)
+	e.client.SetNumCtx(numCtx)
+}
+
+// GetNumCtx returns the current context window size
+func (e *Engine) GetNumCtx() int {
+	return e.budgetMgr.GetNumCtx()
+}
+
+// SyncContextSize updates the context size based on the current model
+// Call this after changing the model
+func (e *Engine) SyncContextSize() {
+	modelCtxSize := e.client.GetModelContextSize()
+	e.budgetMgr.SetNumCtx(modelCtxSize)
+}
+
+// GetTaskBrief returns a task brief at the specified level
+func (e *Engine) GetTaskBrief(level ctxmgr.TaskBriefLevel) *ctxmgr.TaskBrief {
+	e.mu.RLock()
+	objective := e.objective
+	verifyOK := e.lastVerifyOK
+	e.mu.RUnlock()
+
+	cfg := ctxmgr.DefaultTaskBriefConfig(level)
+	cfg.CurrentObjective = objective
+	if verifyOK {
+		cfg.LastVerifyResult = "PASSED"
+	} else {
+		cfg.LastVerifyResult = "FAILED"
+	}
+
+	return e.taskBriefGen.Generate(cfg)
+}
+
+// ForceCompact forces a context compaction
+func (e *Engine) ForceCompact() {
+	e.compactContext("forced")
+}
+
+// compactContext performs context compaction
+func (e *Engine) compactContext(reason string) {
+	tokensBefore := e.budgetMgr.GetState().LastPromptTokens
+
+	// 1. Compact transcript
+	var msgs []ctxmgr.Message
+	for _, m := range e.messages {
+		msgs = append(msgs, ctxmgr.Message{Role: m.Role, Content: m.Content})
+	}
+	compactedMsgs, transcriptSummary := e.compactor.CompactTranscript(msgs, true)
+
+	// Convert back to ollama.Message
+	e.messages = make([]ollama.Message, 0, len(compactedMsgs))
+	for _, m := range compactedMsgs {
+		e.messages = append(e.messages, ollama.Message{Role: m.Role, Content: m.Content})
+	}
+
+	// 2. Shrink task brief
+	brief := e.GetTaskBrief(ctxmgr.TaskBriefCompact)
+
+	// 3. Update rolling memory
+	branch := tools.GetCurrentBranch(e.project.Root)
+	update := ctxmgr.RollingMemoryUpdate{
+		GitBranch:         branch,
+		CurrentObjective:  e.objective,
+		TaskBrief:         brief.FormatCompact(),
+		CompactionSummary: transcriptSummary,
+		Timestamp:         time.Now(),
+	}
+	rollingMemory := e.compactor.BuildRollingMemory(update)
+
+	// Update memory manager with the rolling memory
+	e.memoryMgr.SetBacklogSummary([]string{rollingMemory})
+
+	// Rebuild system prompt with new memory
+	e.rebuildSystemPrompt()
+
+	// Record compaction event
+	tokensAfter := len(e.messages) * 100 // Rough estimate
+	items := fmt.Sprintf("transcript(%d msgs)+taskbrief", len(compactedMsgs))
+	e.budgetMgr.RecordCompaction(reason, tokensBefore, tokensAfter, items)
+
+	e.sendUpdate(CycleUpdate{
+		State:   e.state,
+		Message: fmt.Sprintf("Context compacted: %s (was %d tokens)", items, tokensBefore),
+	})
 }
 
 // run is the main autonomous loop
@@ -492,6 +669,15 @@ func (e *Engine) run(ctx context.Context) {
 		e.mu.Unlock()
 
 		e.cycleCount++
+
+		// Check if test mode cycle limit reached
+		if e.testMode && e.cycleCount >= e.maxCycles {
+			e.sendUpdate(CycleUpdate{
+				State:   StateTerminating,
+				Message: fmt.Sprintf("Test mode: reached max cycles (%d). Exiting.", e.maxCycles),
+			})
+			return
+		}
 	}
 }
 
@@ -690,28 +876,63 @@ func (e *Engine) decide(ctx context.Context) (*ollama.ChatResponse, error) {
 
 	var fullResponse ollama.ChatResponse
 	var contentBuilder strings.Builder
+	var thinkingBuilder strings.Builder
+	thinkingStartTime := time.Now()
+	wasThinking := false
 
 	for chunk := range stream {
 		if chunk.Error != nil {
 			return nil, chunk.Error
 		}
 
-		contentBuilder.WriteString(chunk.Response.Message.Content)
-		e.sendUpdate(CycleUpdate{
-			State:        StateDeciding,
-			TokenContent: chunk.Response.Message.Content,
-			TokensPerSec: chunk.TokensPerSec,
-		})
+		// Handle thinking content (separate from answer content)
+		if chunk.ThinkingContent != "" || chunk.IsThinking {
+			thinkingBuilder.WriteString(chunk.ThinkingContent)
+			wasThinking = true
+			e.sendUpdate(CycleUpdate{
+				State:           StateDeciding,
+				ThinkingContent: chunk.ThinkingContent,
+				IsThinking:      true,
+				TokensPerSec:    chunk.TokensPerSec,
+			})
+		}
+
+		// Handle answer content
+		if chunk.Response.Message.Content != "" {
+			contentBuilder.WriteString(chunk.Response.Message.Content)
+			e.sendUpdate(CycleUpdate{
+				State:        StateDeciding,
+				TokenContent: chunk.Response.Message.Content,
+				IsThinking:   false,
+				TokensPerSec: chunk.TokensPerSec,
+			})
+		}
 
 		if chunk.Response.Done {
 			fullResponse = chunk.Response
+
+			// Capture token metrics on final chunk
+			if chunk.Metrics != nil {
+				e.budgetMgr.UpdateMetrics(chunk.Metrics.PromptEvalCount, chunk.Metrics.EvalCount)
+			}
 		}
 	}
 
 	fullResponse.Message.Content = contentBuilder.String()
 
-	// Log the response
+	// Log thinking trace to disk (NOT added to conversation)
+	if wasThinking {
+		thinkingDuration := time.Since(thinkingStartTime).Milliseconds()
+		e.session.LogThinking(e.cycleCount, thinkingBuilder.String(), thinkingDuration)
+	}
+
+	// Log the response (content only, NOT thinking)
 	e.session.LogMessage("assistant", fullResponse.Message.Content, nil)
+
+	// Check if compaction is needed
+	if e.budgetMgr.NeedsCompaction() {
+		e.compactContext("high_watermark")
+	}
 
 	return &fullResponse, nil
 }
@@ -867,25 +1088,28 @@ func (e *Engine) updateSummary() {
 }
 
 func (e *Engine) trimContext() {
-	// Keep only system message + last 4 messages to avoid entity too large
-	const maxMessages = 5
+	// Use the compactor's transcript compaction with budget manager's max turns
+	maxTurns := e.budgetMgr.GetMaxTranscriptTurns()
+	maxMessages := maxTurns*2 + 1 // +1 for system message
 
 	if len(e.messages) <= maxMessages {
 		return
 	}
 
-	// Keep system message (first) and last few messages
-	newMessages := make([]ollama.Message, 0, maxMessages)
-	newMessages = append(newMessages, e.messages[0]) // system message
-
-	// Add last messages
-	startIdx := len(e.messages) - (maxMessages - 1)
-	if startIdx < 1 {
-		startIdx = 1
+	// Convert to compactor Message format
+	var msgs []ctxmgr.Message
+	for _, m := range e.messages {
+		msgs = append(msgs, ctxmgr.Message{Role: m.Role, Content: m.Content})
 	}
-	newMessages = append(newMessages, e.messages[startIdx:]...)
 
-	e.messages = newMessages
+	// Compact transcript
+	compactedMsgs, _ := e.compactor.CompactTranscript(msgs, true)
+
+	// Convert back to ollama.Message
+	e.messages = make([]ollama.Message, 0, len(compactedMsgs))
+	for _, m := range compactedMsgs {
+		e.messages = append(e.messages, ollama.Message{Role: m.Role, Content: m.Content})
+	}
 }
 
 func (e *Engine) recover(ctx context.Context) {
