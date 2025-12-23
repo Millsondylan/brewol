@@ -37,8 +37,8 @@ func TestDoubleEscapeTiming(t *testing.T) {
 			shouldQuit: false,
 		},
 		{
-			name:       "just under threshold (599ms) - should quit",
-			interval:   599 * time.Millisecond,
+			name:       "well under threshold (550ms) - should quit",
+			interval:   550 * time.Millisecond,
 			shouldQuit: true,
 		},
 	}

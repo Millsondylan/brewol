@@ -17,6 +17,7 @@ type Session struct {
 	LogDir      string
 	transcript  *os.File
 	toolLog     *os.File
+	thinkingLog *os.File
 	mu          sync.Mutex
 }
 
@@ -49,12 +50,20 @@ func NewSession(baseDir string) (*Session, error) {
 		return nil, fmt.Errorf("failed to create tool log file: %w", err)
 	}
 
+	thinkingLog, err := os.Create(filepath.Join(logDir, "thinking.jsonl"))
+	if err != nil {
+		transcript.Close()
+		toolLog.Close()
+		return nil, fmt.Errorf("failed to create thinking log file: %w", err)
+	}
+
 	return &Session{
-		ID:         sessionID,
-		StartTime:  now,
-		LogDir:     logDir,
-		transcript: transcript,
-		toolLog:    toolLog,
+		ID:          sessionID,
+		StartTime:   now,
+		LogDir:      logDir,
+		transcript:  transcript,
+		toolLog:     toolLog,
+		thinkingLog: thinkingLog,
 	}, nil
 }
 
@@ -76,6 +85,31 @@ func (s *Session) LogMessage(role, content string, metadata map[string]interface
 	}
 
 	_, err = s.transcript.Write(append(data, '\n'))
+	return err
+}
+
+// LogThinking logs a thinking trace from the model
+func (s *Session) LogThinking(cycleID int, thinking string, durationMs int64) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entry := Entry{
+		Timestamp: time.Now(),
+		Type:      "thinking",
+		Content:   thinking,
+		Metadata: map[string]interface{}{
+			"cycle_id":    cycleID,
+			"duration_ms": durationMs,
+			"length":      len(thinking),
+		},
+	}
+
+	data, err := json.Marshal(entry)
+	if err != nil {
+		return err
+	}
+
+	_, err = s.thinkingLog.Write(append(data, '\n'))
 	return err
 }
 
@@ -147,6 +181,11 @@ func (s *Session) Close() error {
 	}
 	if s.toolLog != nil {
 		if err := s.toolLog.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if s.thinkingLog != nil {
+		if err := s.thinkingLog.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}

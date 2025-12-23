@@ -48,6 +48,7 @@ func NewRegistry(workspaceRoot string) *Registry {
 	r.Register(&FSPatchTool{root: workspaceRoot})
 	r.Register(&RgSearchTool{root: workspaceRoot})
 	r.Register(&ExecTool{root: workspaceRoot})
+	r.Register(&ShellTool{root: workspaceRoot}) // Used by code block execution
 	r.Register(&GitStatusTool{root: workspaceRoot})
 	r.Register(&GitDiffTool{root: workspaceRoot})
 	r.Register(&GitCheckoutTool{root: workspaceRoot})

@@ -10,8 +10,11 @@ import (
 	"sync"
 	"time"
 
+	ctxmgr "github.com/ai/brewol/internal/context"
 	"github.com/ai/brewol/internal/logs"
+	"github.com/ai/brewol/internal/memory"
 	"github.com/ai/brewol/internal/ollama"
+	"github.com/ai/brewol/internal/prompt"
 	"github.com/ai/brewol/internal/repo"
 	"github.com/ai/brewol/internal/tools"
 )
@@ -68,40 +71,57 @@ type Suggestion struct {
 
 // CycleUpdate represents an update during a cycle
 type CycleUpdate struct {
-	State        State
-	Message      string
-	TokenContent string
-	TokensPerSec float64
-	ToolResult   *tools.ToolResult
-	Suggestions  []Suggestion
-	Objective    string
-	Error        error
+	State           State
+	Message         string
+	TokenContent    string
+	ThinkingContent string // Thinking trace tokens
+	IsThinking      bool   // True if currently in thinking phase
+	TokensPerSec    float64
+	ToolResult      *tools.ToolResult
+	Suggestions     []Suggestion
+	Objective       string
+	Error           error
 }
 
 // Engine is the autonomous agent engine
 type Engine struct {
-	client     *ollama.Client
-	tools      *tools.Registry
-	project    *repo.Project
-	verifier   *repo.Verifier
-	session    *logs.Session
-	messages   []ollama.Message
-	backlog    []BacklogItem
-	objective  string
-	state      State
-	summary    string
-	cycleCount int
-	updates    chan CycleUpdate
-	cancel     context.CancelFunc
-	mu         sync.RWMutex
-	goal       string // user-set goal
-	speed      int    // throttle (0 = no throttle)
+	client        *ollama.Client
+	tools         *tools.Registry
+	project       *repo.Project
+	verifier      *repo.Verifier
+	session       *logs.Session
+	promptMgr     *prompt.Manager
+	memoryMgr     *memory.Manager
+	budgetMgr     *ctxmgr.BudgetManager
+	taskStore     *ctxmgr.TaskStore
+	taskBriefGen  *ctxmgr.TaskBriefGenerator
+	compactor     *ctxmgr.Compactor
+	messages      []ollama.Message
+	backlog       []BacklogItem
+	objective     string
+	state         State
+	summary       string
+	cycleCount    int
+	updates       chan CycleUpdate
+	cancel        context.CancelFunc
+	mu            sync.RWMutex
+	goal          string // user-set goal
+	speed         int    // throttle (0 = no throttle)
+	paused        bool   // pause flag
+	errorCount    int    // consecutive error count
+	lastError     string // last error message
+	lastVerifyOK  bool   // last verification result
+	pendingCommit bool   // whether there are changes pending commit
+	testMode      bool   // test mode flag
+	maxCycles     int    // max cycles in test mode
 }
 
 // Config holds engine configuration
 type Config struct {
 	WorkspaceRoot string
 	Goal          string
+	TestMode      bool // Enable test mode (exit after MaxCycles)
+	MaxCycles     int  // Maximum cycles in test mode
 }
 
 // NewEngine creates a new autonomous engine
@@ -117,17 +137,70 @@ func NewEngine(cfg Config) (*Engine, error) {
 		return nil, fmt.Errorf("failed to create logging session: %w", err)
 	}
 
+	// Create prompt manager for instruction layering
+	promptMgr := prompt.NewManager("brewol", cfg.WorkspaceRoot, string(project.Type))
+
+	// Create memory manager for rolling memory
+	memoryMgr, err := memory.NewManager(memory.Config{
+		WorkspaceRoot:   cfg.WorkspaceRoot,
+		UpdateInterval:  5,
+		MaxContextTurns: 10,
+	})
+	if err != nil {
+		session.Close()
+		return nil, fmt.Errorf("failed to create memory manager: %w", err)
+	}
+
+	// Initialize memory with project info
+	memoryMgr.SetProjectInfo(string(project.Type), project.BuildCommand, project.TestCommand)
+
+	// Create context budget manager
+	// Initialize with model's context size if available
+	budgetCfg := ctxmgr.DefaultBudgetConfig()
+	if model := client.GetModel(); model != "" {
+		budgetCfg.NumCtx = client.GetModelContextSize()
+	}
+	budgetMgr := ctxmgr.NewBudgetManager(budgetCfg)
+
+	// Create task store
+	taskStore, err := ctxmgr.NewTaskStore(cfg.WorkspaceRoot)
+	if err != nil {
+		session.Close()
+		memoryMgr.Close()
+		return nil, fmt.Errorf("failed to create task store: %w", err)
+	}
+
+	// Create task brief generator
+	taskBriefGen := ctxmgr.NewTaskBriefGenerator(taskStore)
+
+	// Create compactor
+	compactorCfg := ctxmgr.DefaultCompactorConfig(cfg.WorkspaceRoot)
+	compactor, err := ctxmgr.NewCompactor(compactorCfg, budgetMgr)
+	if err != nil {
+		session.Close()
+		memoryMgr.Close()
+		return nil, fmt.Errorf("failed to create compactor: %w", err)
+	}
+
 	e := &Engine{
-		client:   client,
-		tools:    toolRegistry,
-		project:  project,
-		verifier: verifier,
-		session:  session,
-		messages: make([]ollama.Message, 0),
-		backlog:  make([]BacklogItem, 0),
-		state:    StateObserving,
-		updates:  make(chan CycleUpdate, 100),
-		goal:     cfg.Goal,
+		client:       client,
+		tools:        toolRegistry,
+		project:      project,
+		verifier:     verifier,
+		session:      session,
+		promptMgr:    promptMgr,
+		memoryMgr:    memoryMgr,
+		budgetMgr:    budgetMgr,
+		taskStore:    taskStore,
+		taskBriefGen: taskBriefGen,
+		compactor:    compactor,
+		messages:     make([]ollama.Message, 0),
+		backlog:      make([]BacklogItem, 0),
+		state:        StateObserving,
+		updates:      make(chan CycleUpdate, 100),
+		goal:         cfg.Goal,
+		testMode:     cfg.TestMode,
+		maxCycles:    cfg.MaxCycles,
 	}
 
 	return e, nil
@@ -185,6 +258,27 @@ func (e *Engine) SetSpeed(speed int) {
 	e.mu.Lock()
 	e.speed = speed
 	e.mu.Unlock()
+}
+
+// Pause pauses the engine
+func (e *Engine) Pause() {
+	e.mu.Lock()
+	e.paused = true
+	e.mu.Unlock()
+}
+
+// Resume resumes the engine
+func (e *Engine) Resume() {
+	e.mu.Lock()
+	e.paused = false
+	e.mu.Unlock()
+}
+
+// IsPaused returns whether the engine is paused
+func (e *Engine) IsPaused() bool {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.paused
 }
 
 // GetState returns the current state
@@ -251,10 +345,242 @@ func (e *Engine) Session() *logs.Session {
 	return e.session
 }
 
+// PromptManager returns the prompt manager
+func (e *Engine) PromptManager() *prompt.Manager {
+	return e.promptMgr
+}
+
+// MemoryManager returns the memory manager
+func (e *Engine) MemoryManager() *memory.Manager {
+	return e.memoryMgr
+}
+
+// GetEffectiveSystemPrompt returns the effective system prompt (redacted for display)
+func (e *Engine) GetEffectiveSystemPrompt() string {
+	return e.promptMgr.GetEffectivePromptRedacted()
+}
+
+// SetSessionInstructions sets session-level instructions and rebuilds the prompt
+func (e *Engine) SetSessionInstructions(instructions string) {
+	e.promptMgr.SetSessionInstructions(instructions)
+	e.rebuildSystemPrompt()
+}
+
+// ClearSessionInstructions clears session instructions and rebuilds the prompt
+func (e *Engine) ClearSessionInstructions() {
+	e.promptMgr.ClearSessionInstructions()
+	e.rebuildSystemPrompt()
+}
+
+// LoadInstructionsFromFile loads instructions from a file
+func (e *Engine) LoadInstructionsFromFile(path string) error {
+	if err := e.promptMgr.LoadInstructionsFromFile(path); err != nil {
+		return err
+	}
+	e.rebuildSystemPrompt()
+	return nil
+}
+
+// SaveSessionInstructions saves session instructions to user config
+func (e *Engine) SaveSessionInstructions() error {
+	return e.promptMgr.SaveSessionToUser()
+}
+
+// GetSummary returns a summary of the current operational state
+func (e *Engine) GetSummary() Summary {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+
+	// Get backlog items (max 5)
+	backlogItems := make([]string, 0, 5)
+	for i, item := range e.backlog {
+		if i >= 5 {
+			break
+		}
+		backlogItems = append(backlogItems, item.Description)
+	}
+
+	branch := tools.GetCurrentBranch(e.project.Root)
+	dirtyFiles := tools.GetDirtyFiles(e.project.Root)
+
+	// Get context metrics
+	budgetState := e.budgetMgr.GetState()
+	lastCompaction := ""
+	if event := e.budgetMgr.GetLastCompactionEvent(); event != nil {
+		lastCompaction = event.CompactedItems
+	}
+
+	return Summary{
+		CurrentObjective:   e.objective,
+		CurrentState:       e.state.String(),
+		CurrentGoal:        e.goal,
+		CycleCount:         e.cycleCount,
+		LastVerificationOK: e.lastVerifyOK,
+		CurrentBranch:      branch,
+		DirtyFiles:         dirtyFiles,
+		BacklogItems:       backlogItems,
+		IsPaused:           e.paused,
+		ErrorCount:         e.errorCount,
+		LastError:          e.lastError,
+		NumCtx:             budgetState.NumCtx,
+		PromptTokens:       budgetState.LastPromptTokens,
+		EvalTokens:         budgetState.LastEvalTokens,
+		ContextUsageRatio:  budgetState.UsageRatio,
+		LastCompaction:     lastCompaction,
+	}
+}
+
+// Summary represents an operational summary
+type Summary struct {
+	CurrentObjective   string
+	CurrentState       string
+	CurrentGoal        string
+	CycleCount         int
+	LastVerificationOK bool
+	CurrentBranch      string
+	DirtyFiles         []string
+	BacklogItems       []string
+	IsPaused           bool
+	ErrorCount         int
+	LastError          string
+	// Context metrics
+	NumCtx            int
+	PromptTokens      int
+	EvalTokens        int
+	ContextUsageRatio float64
+	LastCompaction    string
+}
+
+// ResetMemory resets the working memory
+func (e *Engine) ResetMemory() {
+	e.memoryMgr.Reset()
+	e.rebuildSystemPrompt()
+}
+
+// GetWorkingMemory returns the current working memory text
+func (e *Engine) GetWorkingMemory() string {
+	return e.memoryMgr.GetWorkingMemoryText()
+}
+
+// BudgetManager returns the context budget manager
+func (e *Engine) BudgetManager() *ctxmgr.BudgetManager {
+	return e.budgetMgr
+}
+
+// TaskStore returns the task store
+func (e *Engine) TaskStore() *ctxmgr.TaskStore {
+	return e.taskStore
+}
+
+// TaskBriefGenerator returns the task brief generator
+func (e *Engine) TaskBriefGenerator() *ctxmgr.TaskBriefGenerator {
+	return e.taskBriefGen
+}
+
+// Compactor returns the compactor
+func (e *Engine) Compactor() *ctxmgr.Compactor {
+	return e.compactor
+}
+
+// GetContextState returns the current context budget state
+func (e *Engine) GetContextState() ctxmgr.BudgetState {
+	return e.budgetMgr.GetState()
+}
+
+// SetNumCtx sets the context window size
+func (e *Engine) SetNumCtx(numCtx int) {
+	e.budgetMgr.SetNumCtx(numCtx)
+	e.client.SetNumCtx(numCtx)
+}
+
+// GetNumCtx returns the current context window size
+func (e *Engine) GetNumCtx() int {
+	return e.budgetMgr.GetNumCtx()
+}
+
+// SyncContextSize updates the context size based on the current model
+// Call this after changing the model
+func (e *Engine) SyncContextSize() {
+	modelCtxSize := e.client.GetModelContextSize()
+	e.budgetMgr.SetNumCtx(modelCtxSize)
+}
+
+// GetTaskBrief returns a task brief at the specified level
+func (e *Engine) GetTaskBrief(level ctxmgr.TaskBriefLevel) *ctxmgr.TaskBrief {
+	e.mu.RLock()
+	objective := e.objective
+	verifyOK := e.lastVerifyOK
+	e.mu.RUnlock()
+
+	cfg := ctxmgr.DefaultTaskBriefConfig(level)
+	cfg.CurrentObjective = objective
+	if verifyOK {
+		cfg.LastVerifyResult = "PASSED"
+	} else {
+		cfg.LastVerifyResult = "FAILED"
+	}
+
+	return e.taskBriefGen.Generate(cfg)
+}
+
+// ForceCompact forces a context compaction
+func (e *Engine) ForceCompact() {
+	e.compactContext("forced")
+}
+
+// compactContext performs context compaction
+func (e *Engine) compactContext(reason string) {
+	tokensBefore := e.budgetMgr.GetState().LastPromptTokens
+
+	// 1. Compact transcript
+	var msgs []ctxmgr.Message
+	for _, m := range e.messages {
+		msgs = append(msgs, ctxmgr.Message{Role: m.Role, Content: m.Content})
+	}
+	compactedMsgs, transcriptSummary := e.compactor.CompactTranscript(msgs, true)
+
+	// Convert back to ollama.Message
+	e.messages = make([]ollama.Message, 0, len(compactedMsgs))
+	for _, m := range compactedMsgs {
+		e.messages = append(e.messages, ollama.Message{Role: m.Role, Content: m.Content})
+	}
+
+	// 2. Shrink task brief
+	brief := e.GetTaskBrief(ctxmgr.TaskBriefCompact)
+
+	// 3. Update rolling memory
+	branch := tools.GetCurrentBranch(e.project.Root)
+	update := ctxmgr.RollingMemoryUpdate{
+		GitBranch:         branch,
+		CurrentObjective:  e.objective,
+		TaskBrief:         brief.FormatCompact(),
+		CompactionSummary: transcriptSummary,
+		Timestamp:         time.Now(),
+	}
+	rollingMemory := e.compactor.BuildRollingMemory(update)
+
+	// Update memory manager with the rolling memory
+	e.memoryMgr.SetBacklogSummary([]string{rollingMemory})
+
+	// Rebuild system prompt with new memory
+	e.rebuildSystemPrompt()
+
+	// Record compaction event
+	tokensAfter := len(e.messages) * 100 // Rough estimate
+	items := fmt.Sprintf("transcript(%d msgs)+taskbrief", len(compactedMsgs))
+	e.budgetMgr.RecordCompaction(reason, tokensBefore, tokensAfter, items)
+
+	e.sendUpdate(CycleUpdate{
+		State:   e.state,
+		Message: fmt.Sprintf("Context compacted: %s (was %d tokens)", items, tokensBefore),
+	})
+}
+
 // run is the main autonomous loop
 func (e *Engine) run(ctx context.Context) {
 	defer close(e.updates)
 	defer e.session.Close()
+	defer e.memoryMgr.Close()
 
 	// Initial setup
 	e.initializeSession(ctx)
@@ -265,6 +591,12 @@ func (e *Engine) run(ctx context.Context) {
 			e.sendUpdate(CycleUpdate{State: StateTerminating, Message: "Shutting down..."})
 			return
 		default:
+		}
+
+		// Check for paused state
+		if e.IsPaused() {
+			time.Sleep(500 * time.Millisecond)
+			continue
 		}
 
 		// Check for throttle
@@ -281,14 +613,71 @@ func (e *Engine) run(ctx context.Context) {
 				// Context cancelled - restart with fresh context
 				ctx, e.cancel = context.WithCancel(context.Background())
 				e.sendUpdate(CycleUpdate{State: StateObserving, Message: "Operation cancelled, continuing..."})
+				e.errorCount = 0
 				continue
 			}
-			e.sendUpdate(CycleUpdate{State: StateRecovering, Error: err})
-			// Try to recover
-			e.recover(ctx)
+
+			e.mu.Lock()
+			e.errorCount++
+			e.lastError = err.Error()
+			errorCount := e.errorCount
+			e.mu.Unlock()
+
+			// Check for rate limit errors (403, 429, "limit", "quota")
+			errStr := err.Error()
+			isRateLimit := strings.Contains(errStr, "403") ||
+				strings.Contains(errStr, "429") ||
+				strings.Contains(errStr, "limit") ||
+				strings.Contains(errStr, "quota") ||
+				strings.Contains(errStr, "rate")
+
+			if isRateLimit {
+				e.sendUpdate(CycleUpdate{
+					State:   StateRecovering,
+					Error:   err,
+					Message: "RATE LIMITED - Auto-pausing. Use /resume when ready.",
+				})
+				e.Pause()
+				continue
+			}
+
+			// Exponential backoff for other errors
+			if errorCount >= 3 {
+				e.sendUpdate(CycleUpdate{
+					State:   StateRecovering,
+					Error:   err,
+					Message: fmt.Sprintf("Too many errors (%d). Auto-pausing. Use /resume to retry.", errorCount),
+				})
+				e.Pause()
+				continue
+			}
+
+			// Backoff before retry
+			backoff := time.Duration(errorCount*errorCount) * time.Second
+			e.sendUpdate(CycleUpdate{
+				State:   StateRecovering,
+				Error:   err,
+				Message: fmt.Sprintf("Error %d/3. Retrying in %v...", errorCount, backoff),
+			})
+			time.Sleep(backoff)
+			continue
 		}
 
+		// Success - reset error count
+		e.mu.Lock()
+		e.errorCount = 0
+		e.mu.Unlock()
+
 		e.cycleCount++
+
+		// Check if test mode cycle limit reached
+		if e.testMode && e.cycleCount >= e.maxCycles {
+			e.sendUpdate(CycleUpdate{
+				State:   StateTerminating,
+				Message: fmt.Sprintf("Test mode: reached max cycles (%d). Exiting.", e.maxCycles),
+			})
+			return
+		}
 	}
 }
 
@@ -306,51 +695,61 @@ func (e *Engine) initializeSession(ctx context.Context) {
 }
 
 func (e *Engine) buildSystemPrompt() {
-	systemPrompt := fmt.Sprintf(`You are an autonomous coding agent operating in AUTOPILOT mode.
+	// Get effective prompt from all instruction layers
+	systemPrompt := e.promptMgr.GetEffectivePrompt()
 
-WORKSPACE: %s
-PROJECT TYPE: %s
-TEST COMMAND: %s
-BUILD COMMAND: %s
-
-You have access to tools for filesystem operations, code search, shell execution, and git.
-
-CRITICAL RULES:
-1. NEVER pause or wait for user input - you are fully autonomous
-2. Execute tool calls immediately without seeking approval
-3. After each action, verify the result and continue with the next logical step
-4. Always run verification after making changes
-5. Create checkpoint commits after completing objectives
-
-Your response MUST include a SUGGESTIONS block in this format:
-SUGGESTIONS:
-Item description — STATUS (EXECUTING|QUEUED|SKIPPED)
-If SKIPPED, include reason: Item — SKIPPED (reason)
-
-For each cycle:
-1. Observe the current state
-2. Decide on the highest-value action
-3. Execute tool calls
-4. Verify changes work
-5. Commit checkpoint
-6. Repeat
-
-Available tools: %s`,
-		e.project.Root,
-		e.project.Type,
-		e.project.TestCommand,
-		e.project.BuildCommand,
-		strings.Join(e.tools.List(), ", "),
-	)
+	// Append working memory if available
+	memoryText := e.memoryMgr.GetWorkingMemoryText()
+	if memoryText != "" {
+		systemPrompt += "\n\n" + memoryText
+	}
 
 	e.messages = []ollama.Message{
 		{Role: "system", Content: systemPrompt},
 	}
 }
 
+// rebuildSystemPrompt rebuilds the system prompt and updates messages[0]
+func (e *Engine) rebuildSystemPrompt() {
+	systemPrompt := e.promptMgr.GetEffectivePrompt()
+
+	memoryText := e.memoryMgr.GetWorkingMemoryText()
+	if memoryText != "" {
+		systemPrompt += "\n\n" + memoryText
+	}
+
+	if len(e.messages) > 0 {
+		e.messages[0] = ollama.Message{Role: "system", Content: systemPrompt}
+	} else {
+		e.messages = []ollama.Message{{Role: "system", Content: systemPrompt}}
+	}
+}
+
 func (e *Engine) runCycle(ctx context.Context) error {
+	// Wait for a goal before doing anything
+	e.mu.RLock()
+	goal := e.goal
+	model := e.client.GetModel()
+	e.mu.RUnlock()
+
+	if goal == "" {
+		e.setState(StateObserving)
+		e.sendUpdate(CycleUpdate{State: StateObserving, Message: "Waiting for goal... Type your goal and press Enter"})
+		time.Sleep(2 * time.Second)
+		return nil
+	}
+
+	if model == "" {
+		e.setState(StateObserving)
+		e.sendUpdate(CycleUpdate{State: StateObserving, Message: "No model selected! Use /model to pick one"})
+		time.Sleep(2 * time.Second)
+		return nil
+	}
+
 	// Phase 1: Observe
 	e.setState(StateObserving)
+	e.sendUpdate(CycleUpdate{State: StateObserving, Message: fmt.Sprintf("Goal: %s | Model: %s", goal, model)})
+
 	observation, err := e.observe(ctx)
 	if err != nil {
 		return fmt.Errorf("observe failed: %w", err)
@@ -364,10 +763,14 @@ func (e *Engine) runCycle(ctx context.Context) error {
 
 	// Phase 2: Decide
 	e.setState(StateDeciding)
+	e.sendUpdate(CycleUpdate{State: StateDeciding, Message: "Sending to model..."})
+
 	response, err := e.decide(ctx)
 	if err != nil {
 		return fmt.Errorf("decide failed: %w", err)
 	}
+
+	e.sendUpdate(CycleUpdate{State: StateDeciding, Message: fmt.Sprintf("Got response (%d chars)", len(response.Message.Content))})
 
 	// Parse suggestions from response
 	suggestions := e.parseSuggestions(response.Message.Content)
@@ -376,150 +779,160 @@ func (e *Engine) runCycle(ctx context.Context) error {
 	// Add assistant response to conversation
 	e.messages = append(e.messages, response.Message)
 
-	// Phase 3: Execute tool calls
-	if len(response.Message.ToolCalls) > 0 {
-		e.setState(StateExecuting)
-		for _, tc := range response.Message.ToolCalls {
-			result, err := e.executeToolCall(ctx, tc)
+	// Extract and execute commands from response
+	e.setState(StateExecuting)
+	commands := e.extractCommands(response.Message.Content)
+	if len(commands) > 0 {
+		for _, cmd := range commands {
+			e.sendUpdate(CycleUpdate{State: StateExecuting, Message: fmt.Sprintf("Running: %s", cmd)})
+			result, err := e.tools.Execute(ctx, "shell", json.RawMessage(fmt.Sprintf(`{"command":%q}`, cmd)))
 			if err != nil {
-				e.sendUpdate(CycleUpdate{State: StateExecuting, Error: err, ToolResult: result})
-			} else {
+				e.sendUpdate(CycleUpdate{State: StateExecuting, Message: fmt.Sprintf("Error: %v", err)})
+			} else if result != nil {
 				e.sendUpdate(CycleUpdate{State: StateExecuting, ToolResult: result})
+				// Add result to conversation
+				e.messages = append(e.messages, ollama.Message{
+					Role:    "user",
+					Content: fmt.Sprintf("Command output:\n%s", result.Output),
+				})
 			}
-
-			// Add tool result to conversation
-			e.messages = append(e.messages, ollama.Message{
-				Role:    "tool",
-				Content: result.Output,
-			})
 		}
+	} else {
+		e.sendUpdate(CycleUpdate{State: StateExecuting, Message: "No commands found in response"})
 	}
 
-	// Phase 4: Verify
-	e.setState(StateVerifying)
-	verifyResult := e.verifier.QuickCheck(ctx)
-	e.sendUpdate(CycleUpdate{
-		State:   StateVerifying,
-		Message: fmt.Sprintf("Verification %s (%.2fs)", boolToStatus(verifyResult.Success), verifyResult.Duration.Seconds()),
-	})
-
-	if !verifyResult.Success {
-		// Add failure to conversation for the model to handle
-		e.messages = append(e.messages, ollama.Message{
-			Role:    "user",
-			Content: fmt.Sprintf("VERIFICATION FAILED:\n%s\n\nPlease fix the issue.", verifyResult.Output),
-		})
-		return nil // Let the model handle it in the next cycle
-	}
-
-	// Phase 5: Checkpoint
-	e.setState(StateCommitting)
-	if err := e.createCheckpoint(ctx, e.objective); err != nil {
-		e.sendUpdate(CycleUpdate{State: StateCommitting, Error: err})
-	}
-
-	// Update summary and trim context
-	e.updateSummary()
+	// Trim context to avoid growing too large
 	e.trimContext()
+
+	// Update git state in memory
+	branch := tools.GetCurrentBranch(e.project.Root)
+	e.memoryMgr.SetGitState(branch, "")
+
+	// Notify memory manager of cycle completion (may trigger periodic update)
+	e.memoryMgr.OnCycleComplete(e.cycleCount + 1)
+
+	// Short pause before next cycle
+	time.Sleep(2 * time.Second)
 
 	return nil
 }
 
-func (e *Engine) observe(ctx context.Context) (string, error) {
-	var observations []string
+// extractCommands finds executable commands in the model response
+func (e *Engine) extractCommands(content string) []string {
+	var commands []string
+	lines := strings.Split(content, "\n")
+	inCodeBlock := false
 
-	// Get git status
-	statusResult, _ := e.tools.Execute(ctx, "git_status", json.RawMessage(`{}`))
-	if statusResult != nil && statusResult.Output != "" {
-		observations = append(observations, "GIT STATUS:\n"+statusResult.Output)
-	}
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
 
-	// Get recent changes
-	diffResult, _ := e.tools.Execute(ctx, "git_diff", json.RawMessage(`{}`))
-	if diffResult != nil && diffResult.Output != "" && diffResult.Output != "No changes" {
-		observations = append(observations, "RECENT CHANGES:\n"+diffResult.Output)
-	}
-
-	// Scan for TODOs if backlog is low
-	if len(e.backlog) < 5 {
-		e.refreshBacklog(ctx)
-	}
-
-	// Add backlog info
-	if len(e.backlog) > 0 {
-		var backlogStr strings.Builder
-		backlogStr.WriteString("BACKLOG:\n")
-		for i, item := range e.backlog {
-			if i >= 10 {
-				break
-			}
-			backlogStr.WriteString(fmt.Sprintf("%d. [P%d] %s (%s)\n", i+1, item.Priority, item.Description, item.Source))
+		// Check for code blocks
+		if strings.HasPrefix(line, "```bash") || strings.HasPrefix(line, "```sh") || strings.HasPrefix(line, "```shell") {
+			inCodeBlock = true
+			continue
 		}
-		observations = append(observations, backlogStr.String())
+		if strings.HasPrefix(line, "```") && inCodeBlock {
+			inCodeBlock = false
+			continue
+		}
+
+		// Capture commands in code blocks
+		if inCodeBlock && line != "" && !strings.HasPrefix(line, "#") {
+			commands = append(commands, line)
+		}
+
+		// Also look for "$ command" or "RUN: command" patterns
+		if strings.HasPrefix(line, "$ ") {
+			commands = append(commands, strings.TrimPrefix(line, "$ "))
+		}
+		if strings.HasPrefix(line, "RUN: ") {
+			commands = append(commands, strings.TrimPrefix(line, "RUN: "))
+		}
 	}
 
-	// Add user goal if set
+	return commands
+}
+
+func (e *Engine) observe(ctx context.Context) (string, error) {
+	// Keep observations minimal to avoid entity too large errors
 	e.mu.RLock()
 	goal := e.goal
 	e.mu.RUnlock()
+
 	if goal != "" {
-		observations = append(observations, "USER GOAL: "+goal)
+		return fmt.Sprintf("Goal: %s\nWhat should I do first?", goal), nil
 	}
 
-	// Add rolling summary if exists
-	if e.summary != "" {
-		observations = append(observations, "SESSION SUMMARY:\n"+e.summary)
-	}
-
-	return strings.Join(observations, "\n\n"), nil
+	return "No goal set. Waiting for instructions.", nil
 }
 
 func (e *Engine) decide(ctx context.Context) (*ollama.ChatResponse, error) {
-	prompt := `Based on the current state:
-1. Pick the highest-value task from the backlog (or identify a new one)
-2. Plan the implementation with specific tool calls
-3. Define success criteria
-4. Define rollback strategy if it fails
-
-Remember to include SUGGESTIONS block.
-
-What will you do now?`
-
-	e.messages = append(e.messages, ollama.Message{
-		Role:    "user",
-		Content: prompt,
-	})
-
-	// Stream the response
-	stream, err := e.client.ChatStream(ctx, e.messages, e.tools.ToOllamaTools())
+	// Don't add extra prompts - just use what's in messages
+	// Stream the response WITHOUT tools to avoid entity too large
+	stream, err := e.client.ChatStream(ctx, e.messages, nil)
 	if err != nil {
 		return nil, err
 	}
 
 	var fullResponse ollama.ChatResponse
 	var contentBuilder strings.Builder
+	var thinkingBuilder strings.Builder
+	thinkingStartTime := time.Now()
+	wasThinking := false
 
 	for chunk := range stream {
 		if chunk.Error != nil {
 			return nil, chunk.Error
 		}
 
-		contentBuilder.WriteString(chunk.Response.Message.Content)
-		e.sendUpdate(CycleUpdate{
-			State:        StateDeciding,
-			TokenContent: chunk.Response.Message.Content,
-			TokensPerSec: chunk.TokensPerSec,
-		})
+		// Handle thinking content (separate from answer content)
+		if chunk.ThinkingContent != "" || chunk.IsThinking {
+			thinkingBuilder.WriteString(chunk.ThinkingContent)
+			wasThinking = true
+			e.sendUpdate(CycleUpdate{
+				State:           StateDeciding,
+				ThinkingContent: chunk.ThinkingContent,
+				IsThinking:      true,
+				TokensPerSec:    chunk.TokensPerSec,
+			})
+		}
+
+		// Handle answer content
+		if chunk.Response.Message.Content != "" {
+			contentBuilder.WriteString(chunk.Response.Message.Content)
+			e.sendUpdate(CycleUpdate{
+				State:        StateDeciding,
+				TokenContent: chunk.Response.Message.Content,
+				IsThinking:   false,
+				TokensPerSec: chunk.TokensPerSec,
+			})
+		}
 
 		if chunk.Response.Done {
 			fullResponse = chunk.Response
+
+			// Capture token metrics on final chunk
+			if chunk.Metrics != nil {
+				e.budgetMgr.UpdateMetrics(chunk.Metrics.PromptEvalCount, chunk.Metrics.EvalCount)
+			}
 		}
 	}
 
 	fullResponse.Message.Content = contentBuilder.String()
 
-	// Log the response
+	// Log thinking trace to disk (NOT added to conversation)
+	if wasThinking {
+		thinkingDuration := time.Since(thinkingStartTime).Milliseconds()
+		e.session.LogThinking(e.cycleCount, thinkingBuilder.String(), thinkingDuration)
+	}
+
+	// Log the response (content only, NOT thinking)
 	e.session.LogMessage("assistant", fullResponse.Message.Content, nil)
+
+	// Check if compaction is needed
+	if e.budgetMgr.NeedsCompaction() {
+		e.compactContext("high_watermark")
+	}
 
 	return &fullResponse, nil
 }
@@ -675,50 +1088,53 @@ func (e *Engine) updateSummary() {
 }
 
 func (e *Engine) trimContext() {
-	// Keep system message + last N turns + summary
-	const maxTurns = 20
+	// Use the compactor's transcript compaction with budget manager's max turns
+	maxTurns := e.budgetMgr.GetMaxTranscriptTurns()
+	maxMessages := maxTurns*2 + 1 // +1 for system message
 
-	if len(e.messages) <= maxTurns {
+	if len(e.messages) <= maxMessages {
 		return
 	}
 
-	// Keep system message (first) and last maxTurns-1 messages
-	newMessages := make([]ollama.Message, 0, maxTurns)
-	newMessages = append(newMessages, e.messages[0]) // system message
-
-	// Add summary if available
-	if e.summary != "" {
-		newMessages = append(newMessages, ollama.Message{
-			Role:    "user",
-			Content: "[Session Summary]\n" + e.summary,
-		})
+	// Convert to compactor Message format
+	var msgs []ctxmgr.Message
+	for _, m := range e.messages {
+		msgs = append(msgs, ctxmgr.Message{Role: m.Role, Content: m.Content})
 	}
 
-	// Add last messages
-	startIdx := len(e.messages) - (maxTurns - 2)
-	if startIdx < 1 {
-		startIdx = 1
-	}
-	newMessages = append(newMessages, e.messages[startIdx:]...)
+	// Compact transcript
+	compactedMsgs, _ := e.compactor.CompactTranscript(msgs, true)
 
-	e.messages = newMessages
+	// Convert back to ollama.Message
+	e.messages = make([]ollama.Message, 0, len(compactedMsgs))
+	for _, m := range compactedMsgs {
+		e.messages = append(e.messages, ollama.Message{Role: m.Role, Content: m.Content})
+	}
 }
 
 func (e *Engine) recover(ctx context.Context) {
 	e.setState(StateRecovering)
 	e.sendUpdate(CycleUpdate{State: StateRecovering, Message: "Attempting recovery..."})
 
-	// Try to rollback
-	if tools.IsGitRepo(e.project.Root) {
-		e.tools.Execute(ctx, "git_reset_hard", json.RawMessage(`{"ref": "HEAD~1"}`))
-	}
+	// Only do git reset if there are actual uncommitted changes from a failed operation
+	// Don't reset on API errors
+	e.mu.RLock()
+	lastErr := e.lastError
+	e.mu.RUnlock()
 
-	// Pop the current item from backlog and try the next one
-	e.mu.Lock()
-	if len(e.backlog) > 0 {
-		e.backlog = e.backlog[1:]
+	isAPIError := strings.Contains(lastErr, "API error") ||
+		strings.Contains(lastErr, "403") ||
+		strings.Contains(lastErr, "429") ||
+		strings.Contains(lastErr, "limit")
+
+	if !isAPIError && tools.IsGitRepo(e.project.Root) {
+		// Check if there are uncommitted changes before resetting
+		dirtyFiles := tools.GetDirtyFiles(e.project.Root)
+		if len(dirtyFiles) > 0 {
+			e.sendUpdate(CycleUpdate{State: StateRecovering, Message: "Rolling back uncommitted changes..."})
+			e.tools.Execute(ctx, "git_reset_hard", json.RawMessage(`{"ref": "HEAD"}`))
+		}
 	}
-	e.mu.Unlock()
 }
 
 func (e *Engine) setState(state State) {

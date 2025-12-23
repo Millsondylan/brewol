@@ -1,3 +1,6 @@
+-e hi
+hi
+hi
 # brewol
 
 An autonomous terminal-based coding agent that **never stops working**. It continuously plans, executes, and verifies changes to your codebase using local LLMs via Ollama.
@@ -98,7 +101,7 @@ brewol -w /path/to/project
 
 ## Commands
 
-Access via `Ctrl+K` command palette:
+Access via `Ctrl+K` command palette or by typing directly:
 
 | Command | Description |
 |---------|-------------|
@@ -109,6 +112,30 @@ Access via `Ctrl+K` command palette:
 | `/checkpoint` | Create a manual checkpoint |
 | `/rollback` | Rollback to last checkpoint |
 | `/speed <n>` | Set throttle (0 = no throttle) |
+| `/pause` | Pause the agent |
+| `/resume` | Resume the agent |
+
+### System Instructions Commands
+
+Control the system prompt that guides the agent:
+
+| Command | Description |
+|---------|-------------|
+| `/system show` | Display the effective system prompt (with secrets redacted) |
+| `/system set <text>` | Set session-level instructions immediately |
+| `/system load <path>` | Load instructions from a file (must be in workspace or config dir) |
+| `/system reset` | Clear session instructions, revert to base+repo+user layers |
+| `/system save` | Save session instructions to user config file |
+
+### Memory Commands
+
+View and manage the agent's working memory:
+
+| Command | Description |
+|---------|-------------|
+| `/summary` | Show operational summary (state, goal, branch, backlog) |
+| `/memory` | Show current rolling memory content |
+| `/memory reset` | Clear working memory (logs preserved on disk) |
 
 ## Environment Variables
 
@@ -162,13 +189,30 @@ Tasks are prioritized by impact:
 - **Checkpoint Commits**: Every successful objective creates a commit
 - **Rollback**: Easy recovery to previous state
 
-## Logs
+## Logs & Memory
 
 Session logs are saved to `.brewol/logs/<session-id>/`:
 
 - `transcript.jsonl`: Full conversation history
 - `tools.jsonl`: Tool execution logs
 - `patches/`: Saved patches for recovery
+
+Working memory is stored in `.brewol/memory/`:
+
+- `working_memory.json`: Persistent memory between sessions
+- `transcript_*.jsonl`: Full transcript per session
+- `full_log_*.jsonl`: Detailed logs per session
+
+## Instruction Layering
+
+The system prompt is built from multiple layers, merged in order:
+
+1. **Base Layer** (built-in): Core agent behavior and tool usage instructions
+2. **Repo Layer**: From `.aicoder/system.md`, `AGENT.md`, or `CLAUDE.md` in workspace
+3. **User Layer**: From `~/.config/brewol/system.md`
+4. **Session Layer**: Set live via `/system set`, highest priority
+
+All layers are combined for each model call. Use `/system show` to see the effective prompt.
 
 ## Architecture
 
@@ -180,6 +224,8 @@ internal/
   ├── tools/         # Tool implementations (fs, git, exec, search)
   ├── repo/          # Project detection & verification
   ├── logs/          # Session logging
+  ├── prompt/        # Instruction layering & prompt management
+  ├── memory/        # Rolling memory & summarization
   └── tui/           # Bubble Tea TUI
 ```
 
@@ -194,17 +240,67 @@ go build ./cmd/brewol
 ### Testing
 
 ```bash
+# Run all tests
 go test ./...
+
+# Run tests with coverage
+go test -race -coverprofile=coverage.out ./...
+
+# Run tests in test mode (useful for integration tests)
+go build ./cmd/brewol
+./brewol --test-mode --max-cycles 3 -g "test goal" -m test-model
 ```
 
-### Release
+### Code Formatting
 
-Releases are automated via GoReleaser on tag push:
+Before committing, ensure all code is properly formatted:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+gofmt -w .
 ```
+
+CI will fail if code is not formatted.
+
+### Release Process
+
+Releases are fully automated via GitHub Actions and GoReleaser:
+
+1. **Create and push a version tag:**
+   ```bash
+   # Tag format: vMAJOR.MINOR.PATCH (e.g., v1.2.3)
+   git tag v0.1.0
+   git push origin v0.1.0
+   ```
+
+2. **Automated steps (no manual intervention):**
+   - Full CI runs (tests, linting, formatting checks, multi-platform builds)
+   - GoReleaser creates GitHub Release with:
+     - Binary archives for all platforms (Linux, macOS, Windows)
+     - Checksums
+     - Changelog
+   - Homebrew tap is automatically updated
+
+3. **Installation after release:**
+   ```bash
+   # Homebrew (recommended)
+   brew tap <owner>/tap
+   brew install brewol
+
+   # Or download binary from GitHub Releases
+   # https://github.com/<owner>/brewol/releases
+   ```
+
+### Release Requirements
+
+- All tests must pass
+- Code must be formatted (gofmt)
+- Linting must pass (golangci-lint)
+- Tag must follow semantic versioning: `vMAJOR.MINOR.PATCH`
+
+### GitHub Secrets Required for Releases
+
+The following secrets must be configured in the GitHub repository:
+- `HOMEBREW_TAP_GITHUB_TOKEN`: Personal access token with write access to the Homebrew tap repository
 
 ## Contributing
 
@@ -225,3 +321,55 @@ MIT License - see [LICENSE](LICENSE) for details.
 - [Bubble Tea](https://github.com/charmbracelet/bubbletea) - TUI framework
 - [Lip Gloss](https://github.com/charmbracelet/lipgloss) - Styling
 - [Ollama](https://ollama.ai) - Local LLM runtime
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
+hi
