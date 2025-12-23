@@ -779,26 +779,35 @@ func (e *Engine) runCycle(ctx context.Context) error {
 	// Add assistant response to conversation
 	e.messages = append(e.messages, response.Message)
 
-	// Extract and execute commands from response
+	// Execute tool calls from the model's response
 	e.setState(StateExecuting)
-	commands := e.extractCommands(response.Message.Content)
-	if len(commands) > 0 {
-		for _, cmd := range commands {
-			e.sendUpdate(CycleUpdate{State: StateExecuting, Message: fmt.Sprintf("Running: %s", cmd)})
-			result, err := e.tools.Execute(ctx, "shell", json.RawMessage(fmt.Sprintf(`{"command":%q}`, cmd)))
+	if len(response.Message.ToolCalls) > 0 {
+		var toolResults []string
+		for _, toolCall := range response.Message.ToolCalls {
+			toolName := toolCall.Function.Name
+			e.sendUpdate(CycleUpdate{State: StateExecuting, Message: fmt.Sprintf("Executing tool: %s", toolName)})
+
+			result, err := e.tools.Execute(ctx, toolName, toolCall.Function.Arguments)
 			if err != nil {
-				e.sendUpdate(CycleUpdate{State: StateExecuting, Message: fmt.Sprintf("Error: %v", err)})
+				errMsg := fmt.Sprintf("Tool %s failed: %v", toolName, err)
+				e.sendUpdate(CycleUpdate{State: StateExecuting, Message: errMsg})
+				toolResults = append(toolResults, errMsg)
 			} else if result != nil {
 				e.sendUpdate(CycleUpdate{State: StateExecuting, ToolResult: result})
-				// Add result to conversation
-				e.messages = append(e.messages, ollama.Message{
-					Role:    "user",
-					Content: fmt.Sprintf("Command output:\n%s", result.Output),
-				})
+				toolResults = append(toolResults, fmt.Sprintf("[%s] %s", toolName, result.Output))
 			}
 		}
-	} else {
-		e.sendUpdate(CycleUpdate{State: StateExecuting, Message: "No commands found in response"})
+
+		// Add all tool results back to conversation
+		if len(toolResults) > 0 {
+			e.messages = append(e.messages, ollama.Message{
+				Role:    "user",
+				Content: fmt.Sprintf("Tool Results:\n%s", strings.Join(toolResults, "\n\n")),
+			})
+		}
+	} else if response.Message.Content != "" {
+		// Model provided text response without tools - just continue
+		e.sendUpdate(CycleUpdate{State: StateExecuting, Message: "Model responded with text only, no tools executed"})
 	}
 
 	// Trim context to avoid growing too large
@@ -854,22 +863,47 @@ func (e *Engine) extractCommands(content string) []string {
 }
 
 func (e *Engine) observe(ctx context.Context) (string, error) {
-	// Keep observations minimal to avoid entity too large errors
+	// Gather actual context about the workspace
 	e.mu.RLock()
 	goal := e.goal
 	e.mu.RUnlock()
 
-	if goal != "" {
-		return fmt.Sprintf("Goal: %s\nWhat should I do first?", goal), nil
+	if goal == "" {
+		return "No goal set. Waiting for instructions.", nil
 	}
 
-	return "No goal set. Waiting for instructions.", nil
+	// Build observation by gathering workspace state
+	var parts []string
+	parts = append(parts, fmt.Sprintf("Goal: %s", goal))
+
+	// Get git status if in a git repo
+	if tools.IsGitRepo(e.project.Root) {
+		result, err := e.tools.Execute(ctx, "git_status", json.RawMessage(`{}`))
+		if err == nil && result != nil && result.Output != "" {
+			parts = append(parts, fmt.Sprintf("Git Status:\n%s", result.Output))
+		}
+	}
+
+	// Check for dirty files
+	dirtyFiles := tools.GetDirtyFiles(e.project.Root)
+	if len(dirtyFiles) > 0 {
+		parts = append(parts, fmt.Sprintf("Modified files: %v", dirtyFiles))
+	}
+
+	// First cycle - guide the model
+	if e.cycleCount == 0 {
+		parts = append(parts, "\nThis is your first cycle. Start by understanding the codebase and working towards the goal.")
+	}
+
+	return strings.Join(parts, "\n\n"), nil
 }
 
 func (e *Engine) decide(ctx context.Context) (*ollama.ChatResponse, error) {
-	// Don't add extra prompts - just use what's in messages
-	// Stream the response WITHOUT tools to avoid entity too large
-	stream, err := e.client.ChatStream(ctx, e.messages, nil)
+	// Get tools from registry
+	tools := e.tools.ToOllamaTools()
+
+	// Stream the response WITH tools for autonomous execution
+	stream, err := e.client.ChatStream(ctx, e.messages, tools)
 	if err != nil {
 		return nil, err
 	}
