@@ -139,6 +139,7 @@ type ChatRequest struct {
 	Model    string       `json:"model"`
 	Messages []Message    `json:"messages"`
 	Stream   bool         `json:"stream"`
+	Tools    []Tool       `json:"tools,omitempty"`
 	Options  *ChatOptions `json:"options,omitempty"`
 	Think    *ThinkValue  `json:"think,omitempty"` // Thinking mode: true/false or "low"/"medium"/"high"
 }
@@ -461,6 +462,7 @@ func (c *Client) ChatStream(ctx context.Context, messages []Message, tools []Too
 		Model:    model,
 		Messages: trimmedMessages,
 		Stream:   true,
+		Tools:    tools,
 	}
 
 	// Add options if context size is set
@@ -613,6 +615,7 @@ func (c *Client) Chat(ctx context.Context, messages []Message, tools []Tool) (*C
 		Model:    model,
 		Messages: cleanMessages,
 		Stream:   false,
+		Tools:    tools,
 	}
 
 	// Add options if context size is set

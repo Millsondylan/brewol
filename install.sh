@@ -3,7 +3,7 @@
 
 set -e
 
-VERSION="0.2.1"
+VERSION="0.2.2"
 REPO="Millsondylan/brewol"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 

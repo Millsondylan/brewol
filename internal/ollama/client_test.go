@@ -391,7 +391,7 @@ func TestLookupModelContextSize(t *testing.T) {
 
 		// Prefix matches
 		{"gemini-2.5-flash-exp", 1048576},
-		{"deepseek-r1-lite", 65536}, // matches "deepseek" prefix (not "deepseek-r1")
+		{"deepseek-r1-lite", 131072}, // matches "deepseek-r1" prefix
 
 		// Cloud tag default
 		{"unknown-model:cloud", 131072},
